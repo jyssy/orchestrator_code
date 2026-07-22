@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.markdown import Markdown
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent / ".env", override=False)  # shell env vars take priority
 
 from orchestrator.pipeline import run
 from orchestrator.rag import index_directory
