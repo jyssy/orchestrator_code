@@ -1,0 +1,27 @@
+# Environment — NEVER commit the real .env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+dist/
+build/
+*.egg-info/
+
+# uv
+.uv/
+
+# ChromaDB vector index (large, machine-specific)
+~/.orchestrator/
+chroma/
+*.chroma/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
