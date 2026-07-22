@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env", override=False)  # shell env vars take priority
 
-from orchestrator.pipeline import run
+from orchestrator.pipeline import run, plan
 from orchestrator.rag import index_directory
 
 app = typer.Typer(help="REALMS + local model orchestrator")
@@ -27,13 +27,27 @@ def ask(
     prompt: str = typer.Argument(..., help="Your question or task"),
     file: Path = typer.Option(None, "--file", "-f", help="Path to a file to include as context"),
     no_judge: bool = typer.Option(False, "--no-judge", help="Skip the critique/revision pass"),
+    plan_only: bool = typer.Option(False, "--plan", help="Show a plan and ask for approval before executing"),
 ):
     """Send a prompt through the full router → specialist → judge pipeline."""
     if no_judge:
         os.environ["JUDGE_ENABLED"] = "false"
 
+    ctx_path = str(file) if file else None
+
+    # Plan-first mode: propose changes, gate on approval
+    if plan_only or os.getenv("PLAN_FIRST", "false").lower() == "true":
+        console.print("[dim]Generating plan...[/dim]")
+        proposal = plan(prompt, context_path=ctx_path)
+        console.print(Panel(Markdown(proposal), title="[bold yellow]Plan (no changes made)[/bold yellow]", border_style="yellow"))
+        approved = typer.confirm("\nProceed with implementation?", default=False)
+        if not approved:
+            console.print("[dim]Aborted — no changes made.[/dim]")
+            raise typer.Exit()
+        console.print("[dim]Approved. Running implementation...[/dim]")
+
     console.print(f"[dim]Classifying prompt...[/dim]")
-    result = run(prompt, context_path=str(file) if file else None)
+    result = run(prompt, context_path=ctx_path)
 
     console.print(f"[bold cyan]Task type:[/bold cyan] {result['task_type']}")
     console.print(f"[bold cyan]RAG context:[/bold cyan] {'yes' if result['context_used'] else 'no'}")

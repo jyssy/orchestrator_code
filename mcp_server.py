@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 from fastmcp import FastMCP
-from orchestrator.pipeline import run
+from orchestrator.pipeline import run, plan
 from orchestrator.rag import index_directory
 
 mcp = FastMCP("orchestrator")
@@ -27,6 +27,17 @@ def ask_orchestrator(prompt: str, context_path: str = "") -> str:
     Returns the final answer after any judge revision.
     """
     result = run(prompt, context_path=context_path or None)
+    return result["final"]
+
+
+@mcp.tool()
+def plan_task(prompt: str, context_path: str = "") -> str:
+    """
+    Generate a structured plan for a task without executing it.
+    Returns: scope, proposed changes, what won't change, required checks,
+    human gates, and risks. Present to user for approval before acting.
+    """
+    return plan(prompt, context_path=context_path or None)
     return result["final"]
 
 

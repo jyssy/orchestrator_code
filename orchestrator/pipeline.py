@@ -8,6 +8,51 @@ from orchestrator.rag import retrieve_context
 from orchestrator.specialists import code, ops, reason, summarize
 from orchestrator.judge import critique_and_revise
 
+_PLAN_SYSTEM = """You are a careful technical planner working in a multi-repository
+infrastructure and Django workspace.
+
+Given a task, produce a structured plan with these sections:
+
+## Scope
+- Repository/file(s) affected (read from context — do not guess)
+- Base assumption (what you are treating as current state)
+
+## Proposed changes
+List each change as a bullet: what file, what section, what will change and why.
+
+## What will NOT change
+List explicitly what is out of scope.
+
+## Checks required before executing
+List the exact commands to run for validation (syntax checks, dry-runs, etc.)
+
+## Human gates
+List any actions that require explicit approval before proceeding
+(migrations, deployments, pushes, vault, production changes, service restarts).
+
+## Risks and assumptions
+List unresolved risks, assumptions made, and any information missing.
+
+Do NOT implement anything. Only plan."""
+
+
+def plan(prompt: str, context_path: str | None = None) -> str:
+    """
+    Produce a structured plan for a task without executing it.
+    Returns the plan text for human review.
+    """
+    rag_context = retrieve_context(prompt)
+    if context_path:
+        try:
+            from pathlib import Path
+            extra = Path(context_path).read_text(errors="ignore")[:8000]
+            rag_context = f"{extra}\n\n{rag_context}".strip()
+        except Exception:
+            pass
+
+    plan_prompt = f"{_PLAN_SYSTEM}\n\nTask:\n{prompt}"
+    return reason(plan_prompt, context=rag_context)
+
 
 def run(prompt: str, context_path: str | None = None) -> dict:
     """
