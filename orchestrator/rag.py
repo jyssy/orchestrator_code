@@ -5,8 +5,12 @@ ChromaDB index, rerank with Qwen3-Reranker-8B (REALMS).
 
 import os
 import httpx
+import litellm
 import chromadb
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / ".env", override=False)
 
 _BASE_URL = os.getenv("REALMS_BASE_URL", "https://reallms.rescloud.iu.edu/direct/v1")
 _API_KEY = os.getenv("REALMS_API_KEY", "")
@@ -16,36 +20,39 @@ _FINAL_K = 3     # chunks returned after reranking
 
 
 def _embed(texts: list[str]) -> list[list[float]]:
-    """Embed texts via REALMS Qwen3-Embedding-8B."""
-    response = httpx.post(
-        f"{_BASE_URL}/embeddings",
-        headers={"Authorization": f"Bearer {_API_KEY}"},
-        json={"model": "Qwen3-Embedding-8B", "input": texts},
-        timeout=30.0,
+    """Embed texts via REALMS Qwen3-Embedding-8B using litellm (consistent auth with chat)."""
+    response = litellm.embedding(
+        model="openai/Qwen3-Embedding-8B",
+        input=texts,
+        api_base=_BASE_URL,
+        api_key=_API_KEY,
     )
-    response.raise_for_status()
-    return [item["embedding"] for item in response.json()["data"]]
+    return [item["embedding"] for item in response.data]
 
 
 def _rerank(query: str, documents: list[str]) -> list[int]:
     """
     Rerank documents via REALMS Qwen3-Reranker-8B.
     Returns indices sorted by relevance (best first).
+    Falls back to original order if endpoint unavailable.
     """
-    response = httpx.post(
-        f"{_BASE_URL}/rerank",
-        headers={"Authorization": f"Bearer {_API_KEY}"},
-        json={
-            "model": "Qwen3-Reranker-8B",
-            "query": query,
-            "documents": documents,
-            "top_n": _FINAL_K,
-        },
-        timeout=30.0,
-    )
-    response.raise_for_status()
-    results = response.json().get("results", [])
-    return [r["index"] for r in sorted(results, key=lambda x: x["relevance_score"], reverse=True)]
+    try:
+        response = httpx.post(
+            f"{_BASE_URL}/rerank",
+            headers={"Authorization": f"Bearer {_API_KEY}"},
+            json={
+                "model": "Qwen3-Reranker-8B",
+                "query": query,
+                "documents": documents,
+                "top_n": _FINAL_K,
+            },
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        results = response.json().get("results", [])
+        return [r["index"] for r in sorted(results, key=lambda x: x["relevance_score"], reverse=True)]
+    except Exception:
+        return list(range(min(_FINAL_K, len(documents))))
 
 
 def retrieve_context(query: str) -> str:
@@ -114,8 +121,8 @@ def index_directory(source_dir: str) -> int:
             ids.append(chunk_id)
             metadatas.append({"source": str(file), "offset": i})
 
-    # Embed in batches of 32
-    batch_size = 32
+    # Embed in batches of 8 (smaller = more reliable for remote API)
+    batch_size = 8
     for start in range(0, len(chunks), batch_size):
         batch_chunks = chunks[start : start + batch_size]
         batch_ids = ids[start : start + batch_size]
