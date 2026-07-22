@@ -98,45 +98,100 @@ retrieve relevant chunks and inject them as context.
 
 **CLI reference:**
 ```sh
-uv run python cli.py ask "your prompt"           # basic ask
-uv run python cli.py ask "your prompt" -f path/to/file   # include a file as context
-uv run python cli.py ask "your prompt" --no-judge        # skip critique pass (faster)
-uv run python cli.py index /path/to/dir          # index a directory
+uv run python cli.py ask "your prompt"                    # basic ask
+uv run python cli.py ask "your prompt" -f path/to/file    # include a file as context
+uv run python cli.py ask "your prompt" --no-judge         # skip critique pass (faster)
+uv run python cli.py ask "your prompt" --plan             # plan first, then approve
+uv run python cli.py index /path/to/dir                   # index a directory
+```
+
+---
+
+## Daily usage patterns
+
+### Read-only analysis (no approval needed)
+```sh
+uv run python cli.py ask "explain the dependency chain between CMS infra and PortalCMS Django" --no-judge
+```
+
+### Conservative / ops tasks — plan first, approve before executing
+```sh
+# Shows: scope, proposed changes, what won't change, required checks, human gates, risks
+# Then asks: "Proceed with implementation? [y/N]"
+uv run python cli.py ask "add a --limit guard to the warehouse deploy playbook" \
+  --plan -f access-sysops/Operations_Warehouse_Infrastructure/ansible/apiserver_playbook.yml
+```
+
+Set `PLAN_FIRST=true` in `.env` to make plan-gating the default for every `ask`.
+
+### Safe coding tasks
+```sh
+uv run python cli.py ask "write a Python helper to parse the warehouse API response envelope"
+```
+
+### Large file / whole-repo questions (uses gemma-4-31B-it, 262K context)
+```sh
+uv run python cli.py ask "summarise all the Ansible roles and what hosts they target" \
+  -f access-sysops/Operations_CMS_Infrastructure/ansible/application_playbook.yml
 ```
 
 ---
 
 ## Phase 4 — MCP server (VS Code Copilot integration)
 
-The MCP server exposes `ask_orchestrator` and `index_codebase` as tools
-that VS Code Copilot can call directly from agent mode.
+The MCP server exposes three tools that VS Code Copilot can call in agent mode:
+- `ask_orchestrator` — routes a prompt through the full pipeline and returns the answer
+- `plan_task` — generates a scoped plan (scope, changes, checks, human gates, risks) without executing anything
+- `index_codebase` — indexes a directory into the RAG vector store
+
+**Recommended workflow in Copilot agent mode:**
+1. Call `plan_task` first → review the output
+2. If approved, call `ask_orchestrator` to implement
 
 **Start the server** (keep this running in a terminal while coding):
 ```sh
 uv run python mcp_server.py
 ```
 
-**Register it in VS Code** — add to `~/.vscode/settings.json` or your workspace
-`settings.json`:
+**Register it in VS Code** — the config lives at:
+```
+~/Library/Application Support/Code/User/mcp.json
+```
+Contents:
 ```json
 {
-  "mcp": {
-    "servers": {
-      "orchestrator": {
-        "type": "stdio",
-        "command": "uv",
-        "args": ["run", "python", "mcp_server.py"],
-        "cwd": "/Users/jelambeadmin/Documents/orchestrator_code"
-      }
+  "servers": {
+    "orchestrator": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "python", "mcp_server.py"],
+      "cwd": "/Users/jelambeadmin/Documents/orchestrator_code"
     }
   }
 }
 ```
 
 **Verify:**
-- In VS Code Copilot agent mode, type `#ask_orchestrator` — it should appear as an available tool
-- Ask: "Use ask_orchestrator to refactor the contacts_updater.py file"
-  The orchestrator will route it to Qwen3-Coder-Next with RAG context injected
+- In VS Code Copilot agent mode, type `#plan_task` or `#ask_orchestrator` — both should appear as available tools
+- Try: *"Use plan_task to propose how to refactor the contacts_updater.py file"*
+
+---
+
+## Human gates — what always requires your approval
+
+Consistent with repo-level AGENTS.md conventions across this workspace:
+
+| Action | Gate |
+|---|---|
+| `terraform apply` / `plan` | Always human-run |
+| `ansible-playbook` execution | Always human-run from bastion |
+| Database migrations (`migrate`) | Explicit approval + DBA review |
+| Git push / merge / tag / release | Explicit approval |
+| Vault / credential / secret changes | Explicit approval |
+| Production service restarts | Explicit approval |
+| Submodule pointer updates | Separately scoped task |
+
+The orchestrator will **propose** these actions in its plan output but will never execute them.
 
 ---
 
