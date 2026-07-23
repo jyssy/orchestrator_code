@@ -23,6 +23,7 @@ def critique_and_revise(
     prompt: str,
     draft: str,
     enabled: bool | None = None,
+    context: str = "",
 ) -> str:
     """
     Run a critique pass on draft. If issues are found, produce one revision.
@@ -35,7 +36,10 @@ def critique_and_revise(
         return draft
 
     critique_prompt = f"User request:\n{prompt}\n\nDraft answer:\n{draft}"
-    critique = reason(critique_prompt, context=f"system: {_CRITIQUE_SYSTEM}")
+    critique_context = f"system: {_CRITIQUE_SYSTEM}"
+    if context:
+        critique_context = f"{critique_context}\n\nEffective policy and context:\n{context}"
+    critique = reason(critique_prompt, context=critique_context)
 
     if critique.strip().upper().startswith("LGTM"):
         return draft
@@ -46,4 +50,7 @@ def critique_and_revise(
         f"Critique:\n{critique}\n\n"
         "Produce the corrected answer."
     )
-    return reason(revision_prompt, context=f"system: {_REVISE_SYSTEM}")
+    revision_context = f"system: {_REVISE_SYSTEM}"
+    if context:
+        revision_context = f"{revision_context}\n\nEffective policy and context:\n{context}"
+    return reason(revision_prompt, context=revision_context)

@@ -32,10 +32,14 @@ def test_pipeline_passes_per_call_judge_setting(monkeypatch):
     received = {}
 
     monkeypatch.setattr(pipeline, "classify", lambda prompt: "coding")
-    monkeypatch.setattr(pipeline, "retrieve_context", lambda prompt: "")
+    monkeypatch.setattr(
+        pipeline,
+        "retrieve_context",
+        lambda prompt, repo_root=None: "",
+    )
     monkeypatch.setattr(pipeline, "code", lambda prompt, context: "draft")
 
-    def fake_judge(prompt, draft, enabled=None):
+    def fake_judge(prompt, draft, enabled=None, context=""):
         received["enabled"] = enabled
         return draft
 
@@ -50,7 +54,13 @@ def test_pipeline_passes_per_call_judge_setting(monkeypatch):
 def test_no_judge_cli_option_disables_judge_for_that_request(monkeypatch):
     received = {}
 
-    def fake_run(prompt, context_path=None, judge_enabled=None):
+    def fake_run(
+        prompt,
+        context_path=None,
+        judge_enabled=None,
+        context_paths=None,
+        repo_root=None,
+    ):
         received["judge_enabled"] = judge_enabled
         return {
             "task_type": "coding",
@@ -70,8 +80,16 @@ def test_no_judge_cli_option_disables_judge_for_that_request(monkeypatch):
 def test_mcp_ask_forwards_judge_choice(monkeypatch):
     received = {}
 
-    def fake_run(prompt, context_path=None, judge_enabled=None):
+    def fake_run(
+        prompt,
+        context_path=None,
+        judge_enabled=None,
+        context_paths=None,
+        repo_root=None,
+    ):
         received["context_path"] = context_path
+        received["context_paths"] = context_paths
+        received["repo_root"] = repo_root
         received["judge_enabled"] = judge_enabled
         return {"final": "answer"}
 
@@ -86,5 +104,7 @@ def test_mcp_ask_forwards_judge_choice(monkeypatch):
     assert result == "answer"
     assert received == {
         "context_path": "example.py",
+        "context_paths": None,
+        "repo_root": None,
         "judge_enabled": False,
     }

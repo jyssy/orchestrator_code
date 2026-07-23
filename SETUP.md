@@ -87,22 +87,33 @@ Expected output:
 - Draft answer from Qwen3-Coder-Next
 - Revised answer (if judge found issues) from gpt-oss-120b
 
-**Index your codebase for RAG** (run once, re-run after large changes):
+**Audit, then build the RAG index** (run once, re-run after large changes):
 ```sh
-uv run python cli.py index /Users/jelambeadmin/Documents/access-sysops
+uv run python cli.py audit-index /Users/jelambeadmin/Documents/access-sysops
+uv run python cli.py index /Users/jelambeadmin/Documents/access-sysops --rebuild
 ```
 
-This embeds all `.py`, `.yml`, `.tf`, `.md`, `.sh`, `.j2` files via Qwen3-Embedding-8B
-and stores them in `~/.orchestrator/chroma`. Subsequent `ask` calls will automatically
-retrieve relevant chunks and inject them as context.
+The audit makes no model calls. Indexing prunes generated environments and caches,
+honors Git ignores and `.orchestratorignore`, rejects secret-bearing paths and
+high-confidence secret content, and only then sends safe chunks to
+Qwen3-Embedding-8B. The sanitized index is stored in `~/.orchestrator/chroma`.
+`--rebuild` removes stale chunks from older scans.
+Rebuild is the safe default. Use `--resume` only after an interrupted run and only
+when the source tree has not changed.
+
+Retrieved chunks are labelled with their source and can be restricted to one Git
+repository with `--repo-root`. Effective `AGENTS.md` guidance and read-only Git
+state are loaded deterministically before RAG context.
 
 **CLI reference:**
 ```sh
 uv run python cli.py ask "your prompt"                    # basic ask
 uv run python cli.py ask "your prompt" -f path/to/file    # include a file as context
+uv run python cli.py ask "your prompt" --repo-root /repo  # load AGENTS.md + repo RAG
 uv run python cli.py ask "your prompt" --no-judge         # skip critique pass (faster)
 uv run python cli.py ask "your prompt" --plan             # plan first, then approve
-uv run python cli.py index /path/to/dir                   # index a directory
+uv run python cli.py audit-index /path/to/dir             # safety scan; no API calls
+uv run python cli.py index /path/to/dir --rebuild         # sanitized full rebuild
 ```
 
 ---
@@ -119,7 +130,9 @@ uv run python cli.py ask "explain the dependency chain between CMS infra and Por
 # Shows: scope, proposed changes, what won't change, required checks, human gates, risks
 # Then asks: "Proceed with implementation? [y/N]"
 uv run python cli.py ask "add a --limit guard to the warehouse deploy playbook" \
-  --plan -f access-sysops/Operations_Warehouse_Infrastructure/ansible/apiserver_playbook.yml
+  --plan \
+  --repo-root access-sysops/Operations_Warehouse_Infrastructure \
+  -f access-sysops/Operations_Warehouse_Infrastructure/ansible/apiserver_playbook.yml
 ```
 
 Set `PLAN_FIRST=true` in `.env` to make plan-gating the default for every `ask`.
@@ -139,18 +152,21 @@ uv run python cli.py ask "summarise all the Ansible roles and what hosts they ta
 
 ## Phase 4 — MCP server (Codex and VS Code integration)
 
-The MCP server exposes three tools that Codex, VS Code Copilot, and other MCP clients can call:
+The MCP server exposes four tools that Codex, VS Code Copilot, and other MCP clients can call:
 - `ask_orchestrator` — routes a prompt through the full pipeline and returns the answer; pass `use_judge=false` for a faster single-pass response
 - `plan_task` — generates a scoped plan (scope, changes, checks, human gates, risks) without executing anything
-- `index_codebase` — indexes a directory into the RAG vector store
+- `audit_index` — reports what is safe to index without making model calls
+- `index_codebase` — safety-scans and indexes a directory into the RAG vector store
 
 The server is advisory. It does not edit files or run commands. Codex or another
 coding agent must apply the response and perform validation.
 
 **Recommended agent workflow:**
-1. Call `plan_task` first → review the output
-2. If approved, call `ask_orchestrator` for specialist guidance
-3. Have the calling agent edit the files and run the checks
+1. Start Codex in the target Git repository so its local `AGENTS.md` is active.
+2. Call `plan_task` with that repository as `repo_root` → review the output.
+3. If approved, call `ask_orchestrator` with the same `repo_root`.
+4. Have the calling agent edit the files and run only checks permitted by the
+   effective `AGENTS.md`; human-only checks remain explicitly pending.
 
 **Optional diagnostic start:**
 ```sh
@@ -174,7 +190,7 @@ enabled = true
 required = false
 startup_timeout_sec = 30
 tool_timeout_sec = 300
-enabled_tools = ["plan_task", "ask_orchestrator"]
+enabled_tools = ["plan_task", "ask_orchestrator", "audit_index"]
 ```
 
 Restart Codex, then verify with `codex mcp list` or `/mcp`. Run Codex in the
@@ -187,8 +203,10 @@ codex -C /Users/jelambeadmin/Documents/access-sysops/Operations_PortalCMS_Django
 Example prompt:
 
 > Call the orchestrator's plan_task tool first and show me the plan. After I
-> approve it, call ask_orchestrator, inspect its advice, make the changes in the
-> workspace, and run the relevant tests. Do not push or deploy.
+> approve it, call ask_orchestrator with this repository as repo_root, inspect
+> its advice, make the changes in the workspace, and run only checks permitted
+> by the effective AGENTS.md. Report prohibited checks as pending. Do not push
+> or deploy.
 
 ### Register with VS Code Copilot
 
@@ -231,6 +249,8 @@ Consistent with repo-level AGENTS.md conventions across this workspace:
 | Submodule pointer updates | Separately scoped task |
 
 The orchestrator will **propose** these actions in its plan output but will never execute them.
+The calling agent must also leave any validation command prohibited by the
+effective repository `AGENTS.md` pending for an authorized human.
 
 ---
 
@@ -274,6 +294,12 @@ seconds for startup and 300 seconds for an orchestrator tool call.
 
 **Judge pass is slow:** Set `JUDGE_ENABLED=false` in `.env` or pass `--no-judge` to the CLI.
 
-**RAG returns empty context:** Run `uv run python cli.py index` to build the index first.
+**RAG returns empty context:** Confirm `repo_root` matches the indexed Git root,
+then run `uv run python cli.py audit-index` followed by
+`uv run python cli.py index /path/to/source --rebuild`.
+
+**A context file is refused:** Do not bypass the safety filter. Vault, password,
+credential, environment, private-key, and Terraform-state files must remain
+outside model context.
 
 **Continue.dev models not appearing:** Reload VS Code window (`⇧⌘P` → `Developer: Reload Window`).
