@@ -107,6 +107,7 @@ state are loaded deterministically before RAG context.
 
 **CLI reference:**
 ```sh
+uv run orchestrate work "your coding task" --repo-root /repo  # guarded Codex workflow
 uv run python cli.py ask "your prompt"                    # basic ask
 uv run python cli.py ask "your prompt" -f path/to/file    # include a file as context
 uv run python cli.py ask "your prompt" --repo-root /repo  # load AGENTS.md + repo RAG
@@ -119,6 +120,74 @@ uv run python cli.py index /path/to/dir --rebuild         # sanitized full rebui
 ---
 
 ## Daily usage patterns
+
+Use one of these two workflows. Do not let Codex and Copilot write to the same
+repository at the same time.
+
+### 1. Codex CLI (recommended)
+
+Change to the repository you want edited:
+
+```sh
+cd /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
+/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/orchestrate work \
+  "describe the coding change and what done means"
+```
+
+The launcher uses the current Git root as `repo_root`, starts Codex with
+`workspace-write` sandboxing and on-request approvals, and instructs Codex to:
+
+1. Read the effective `AGENTS.md`.
+2. Call `plan_task` with the task and repository.
+3. Show the plan and stop without editing.
+4. Wait for a separate approval message.
+
+After reviewing the plan, reply in the same Codex session:
+
+> Approved. Implement the plan. Preserve existing unrelated changes.
+
+Codex will call `ask_orchestrator` with the same `repo_root`, implement the
+approved scope, run permitted checks, and report the final diff, checks run,
+checks not run, failures, assumptions, and risks. It will not commit, push,
+deploy, access secrets, or perform human-gated operations without separate
+explicit authorization.
+
+To target a repository without changing directories:
+
+```sh
+cd /Users/jelambeadmin/Documents/orchestrator_code
+uv run orchestrate work \
+  "describe the coding change and what done means" \
+  --repo-root /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
+```
+
+To preview the guarded prompt without launching Codex:
+
+```sh
+uv run orchestrate work "your task" --repo-root /repo --print-only
+```
+
+### 2. VS Code Copilot Agent mode
+
+Generate the equivalent prompt:
+
+```sh
+cd /Users/jelambeadmin/Documents/orchestrator_code
+uv run orchestrate work \
+  "describe the coding change and what done means" \
+  --repo-root /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure \
+  --executor copilot
+```
+
+Copy the generated prompt into Copilot Agent mode. Copilot should call
+`#plan_task`, show the plan, and stop without editing. After reviewing it, reply:
+
+> Approved. Implement the plan. Preserve existing unrelated changes.
+
+Copilot should then call `#ask_orchestrator` with the same `repo_root`, implement
+the approved scope, run checks permitted by `AGENTS.md`, and provide the same
+structured handoff. If the Copilot MCP connection is unstable, use option 1,
+Codex CLI.
 
 ### Read-only analysis (no approval needed)
 ```sh
@@ -251,6 +320,14 @@ Consistent with repo-level AGENTS.md conventions across this workspace:
 The orchestrator will **propose** these actions in its plan output but will never execute them.
 The calling agent must also leave any validation command prohibited by the
 effective repository `AGENTS.md` pending for an authorized human.
+
+Keep Git actions separate from implementation. Let the agent use read-only
+inspection commands such as `git status`, `git diff`, and `git diff --check`.
+After reviewing the handoff, request a local commit explicitly if wanted:
+
+> Create one local commit for the approved changes. Do not push.
+
+Authorize pushes, merges, tags, releases, or deployments as separate actions.
 
 ---
 

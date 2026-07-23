@@ -4,6 +4,8 @@ Usage: uv run python cli.py "your prompt here"
 """
 
 import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,11 +17,95 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env", override=False)  # shell env vars take priority
 
-from orchestrator.pipeline import run, plan
-from orchestrator.rag import index_directory, scan_directory
+from orchestrator.workflow import (
+    Executor,
+    build_codex_command,
+    build_codex_prompt,
+    build_copilot_prompt,
+    resolve_target_repo,
+)
 
 app = typer.Typer(help="REALMS + local model orchestrator")
 console = Console()
+
+
+def run(*args, **kwargs):
+    """Load the model pipeline only when an ask command actually needs it."""
+    from orchestrator.pipeline import run as pipeline_run
+
+    return pipeline_run(*args, **kwargs)
+
+
+def plan(*args, **kwargs):
+    """Load the model pipeline only when an ask command actually needs it."""
+    from orchestrator.pipeline import plan as pipeline_plan
+
+    return pipeline_plan(*args, **kwargs)
+
+
+@app.command()
+def work(
+    task: str = typer.Argument(..., help="Coding task to plan and implement"),
+    repo_root: Path = typer.Option(
+        None,
+        "--repo-root",
+        "-r",
+        help="Target repository or a directory inside it; defaults to the current directory",
+    ),
+    executor: Executor = typer.Option(
+        Executor.CODEX,
+        "--executor",
+        "-e",
+        help="Code executor to prepare",
+        case_sensitive=False,
+    ),
+    print_only: bool = typer.Option(
+        False,
+        "--print-only",
+        help="Print the launch details and guarded prompt without starting Codex",
+    ),
+):
+    """Start the guarded orchestrator → approval → coding-agent workflow."""
+    try:
+        target = resolve_target_repo(repo_root)
+        if executor is Executor.CODEX:
+            prompt = build_codex_prompt(task, target)
+        else:
+            prompt = build_copilot_prompt(task, target)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    console.print(f"[bold cyan]Repository:[/bold cyan] {target}")
+    console.print(f"[bold cyan]Executor:[/bold cyan] {executor.value}")
+
+    if executor is Executor.COPILOT:
+        console.print(
+            Panel(
+                prompt,
+                title="Paste into VS Code Copilot Agent mode",
+                border_style="blue",
+            )
+        )
+        return
+
+    try:
+        command = build_codex_command(task, target)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if print_only:
+        preview = [*command[:-1], "<guarded workflow prompt>"]
+        console.print(f"[bold cyan]Command:[/bold cyan] {shlex.join(preview)}")
+        console.print(Panel(prompt, title="Initial Codex prompt", border_style="blue"))
+        return
+
+    console.print(
+        "[dim]Launching Codex. It must show the orchestrator plan and wait for "
+        "approval before editing.[/dim]"
+    )
+    completed = subprocess.run(command, check=False)
+    if completed.returncode:
+        raise typer.Exit(completed.returncode)
 
 
 @app.command()
@@ -83,6 +169,8 @@ def index(
     ),
 ):
     """Safety-scan and index a directory into the local ChromaDB vector store."""
+    from orchestrator.rag import index_directory
+
     console.print(f"[dim]Scanning {source} before transmission...[/dim]")
 
     def show_progress(done: int, total: int) -> None:
@@ -104,6 +192,8 @@ def audit_index(
     ),
 ):
     """Report what would be indexed without making API calls or writing Chroma."""
+    from orchestrator.rag import scan_directory
+
     _, report = scan_directory(str(source))
     console.print(report.summary(audit=True))
 
