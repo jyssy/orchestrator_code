@@ -16,21 +16,43 @@ from fastmcp import FastMCP
 from orchestrator.pipeline import run, plan
 from orchestrator.rag import index_directory
 
-mcp = FastMCP("orchestrator")
+_INSTRUCTIONS = """This server is advisory: its tools generate plans and answers but
+never edit files or run validation commands. For a requested change, call plan_task
+first and present the result for approval. After approval, call ask_orchestrator.
+The MCP client (for example, Codex) must inspect the response, edit the workspace,
+and run the required checks itself. Call index_codebase only when the user explicitly
+asks to refresh the RAG index."""
+
+mcp = FastMCP("orchestrator", instructions=_INSTRUCTIONS)
 
 
-@mcp.tool()
-def ask_orchestrator(prompt: str, context_path: str = "") -> str:
+@mcp.tool(
+    timeout=300,
+    annotations={"readOnlyHint": True, "openWorldHint": True},
+)
+def ask_orchestrator(
+    prompt: str,
+    context_path: str = "",
+    use_judge: bool = True,
+) -> str:
     """
     Route a prompt through the full REALMS + local model pipeline.
     Optionally pass a file path to include as additional context.
-    Returns the final answer after any judge revision.
+    Set use_judge=false for a faster single-pass response.
+    Returns the final answer after any requested judge revision.
     """
-    result = run(prompt, context_path=context_path or None)
+    result = run(
+        prompt,
+        context_path=context_path or None,
+        judge_enabled=use_judge,
+    )
     return result["final"]
 
 
-@mcp.tool()
+@mcp.tool(
+    timeout=300,
+    annotations={"readOnlyHint": True, "openWorldHint": True},
+)
 def plan_task(prompt: str, context_path: str = "") -> str:
     """
     Generate a structured plan for a task without executing it.
@@ -38,10 +60,17 @@ def plan_task(prompt: str, context_path: str = "") -> str:
     human gates, and risks. Present to user for approval before acting.
     """
     return plan(prompt, context_path=context_path or None)
-    return result["final"]
 
 
-@mcp.tool()
+@mcp.tool(
+    timeout=600,
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
 def index_codebase(source_dir: str = "") -> str:
     """
     Index a directory into the local RAG vector store.

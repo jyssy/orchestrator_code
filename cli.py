@@ -30,9 +30,6 @@ def ask(
     plan_only: bool = typer.Option(False, "--plan", help="Show a plan and ask for approval before executing"),
 ):
     """Send a prompt through the full router → specialist → judge pipeline."""
-    if no_judge:
-        os.environ["JUDGE_ENABLED"] = "false"
-
     ctx_path = str(file) if file else None
 
     # Plan-first mode: propose changes, gate on approval
@@ -47,7 +44,11 @@ def ask(
         console.print("[dim]Approved. Running implementation...[/dim]")
 
     console.print(f"[dim]Classifying prompt...[/dim]")
-    result = run(prompt, context_path=ctx_path)
+    result = run(
+        prompt,
+        context_path=ctx_path,
+        judge_enabled=False if no_judge else None,
+    )
 
     console.print(f"[bold cyan]Task type:[/bold cyan] {result['task_type']}")
     console.print(f"[bold cyan]RAG context:[/bold cyan] {'yes' if result['context_used'] else 'no'}")

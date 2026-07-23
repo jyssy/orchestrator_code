@@ -54,7 +54,11 @@ def plan(prompt: str, context_path: str | None = None) -> str:
     return reason(plan_prompt, context=rag_context)
 
 
-def run(prompt: str, context_path: str | None = None) -> dict:
+def run(
+    prompt: str,
+    context_path: str | None = None,
+    judge_enabled: bool | None = None,
+) -> dict:
     """
     Orchestrate a full request through the pipeline.
 
@@ -85,7 +89,7 @@ def run(prompt: str, context_path: str | None = None) -> dict:
         draft = reason(prompt, context=rag_context)
 
     # 4. Judge pass (critique + optional revision)
-    final = critique_and_revise(prompt, draft)
+    final = critique_and_revise(prompt, draft, enabled=judge_enabled)
 
     return {
         "task_type": task_type,

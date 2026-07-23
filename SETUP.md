@@ -137,23 +137,62 @@ uv run python cli.py ask "summarise all the Ansible roles and what hosts they ta
 
 ---
 
-## Phase 4 — MCP server (VS Code Copilot integration)
+## Phase 4 — MCP server (Codex and VS Code integration)
 
-The MCP server exposes three tools that VS Code Copilot can call in agent mode:
-- `ask_orchestrator` — routes a prompt through the full pipeline and returns the answer
+The MCP server exposes three tools that Codex, VS Code Copilot, and other MCP clients can call:
+- `ask_orchestrator` — routes a prompt through the full pipeline and returns the answer; pass `use_judge=false` for a faster single-pass response
 - `plan_task` — generates a scoped plan (scope, changes, checks, human gates, risks) without executing anything
 - `index_codebase` — indexes a directory into the RAG vector store
 
-**Recommended workflow in Copilot agent mode:**
-1. Call `plan_task` first → review the output
-2. If approved, call `ask_orchestrator` to implement
+The server is advisory. It does not edit files or run commands. Codex or another
+coding agent must apply the response and perform validation.
 
-**Start the server** (keep this running in a terminal while coding):
+**Recommended agent workflow:**
+1. Call `plan_task` first → review the output
+2. If approved, call `ask_orchestrator` for specialist guidance
+3. Have the calling agent edit the files and run the checks
+
+**Optional diagnostic start:**
 ```sh
-uv run python mcp_server.py
+.venv/bin/python mcp_server.py
 ```
 
-**Register it in VS Code** — the config lives at:
+Normally, do not start the server manually. A stdio MCP client starts and owns
+the process automatically.
+
+### Register with Codex
+
+Codex CLI, the Codex IDE extension, and the desktop app share the MCP configuration
+in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.orchestrator]
+command = "/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/python"
+args = ["/Users/jelambeadmin/Documents/orchestrator_code/mcp_server.py"]
+cwd = "/Users/jelambeadmin/Documents/orchestrator_code"
+enabled = true
+required = false
+startup_timeout_sec = 30
+tool_timeout_sec = 300
+enabled_tools = ["plan_task", "ask_orchestrator"]
+```
+
+Restart Codex, then verify with `codex mcp list` or `/mcp`. Run Codex in the
+repository that it should edit:
+
+```sh
+codex -C /Users/jelambeadmin/Documents/access-sysops/Operations_PortalCMS_Django
+```
+
+Example prompt:
+
+> Call the orchestrator's plan_task tool first and show me the plan. After I
+> approve it, call ask_orchestrator, inspect its advice, make the changes in the
+> workspace, and run the relevant tests. Do not push or deploy.
+
+### Register with VS Code Copilot
+
+The config lives at:
 ```
 ~/Library/Application Support/Code/User/mcp.json
 ```
@@ -163,8 +202,8 @@ Contents:
   "servers": {
     "orchestrator": {
       "type": "stdio",
-      "command": "uv",
-      "args": ["run", "python", "mcp_server.py"],
+      "command": "/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/python",
+      "args": ["/Users/jelambeadmin/Documents/orchestrator_code/mcp_server.py"],
       "cwd": "/Users/jelambeadmin/Documents/orchestrator_code"
     }
   }
@@ -228,6 +267,10 @@ Keep at most **one** 7B model loaded at a time. REALMS handles the heavy lifting
 **`REALMS_API_KEY` not found:** Run `source ~/.zshrc` or add to `.env` file.
 
 **Ollama not responding:** Run `brew services restart ollama` or `ollama serve` in a terminal.
+
+**MCP server connects intermittently:** Use the absolute `.venv/bin/python` command
+shown above instead of `uv run`, restart the MCP client, and allow at least 30
+seconds for startup and 300 seconds for an orchestrator tool call.
 
 **Judge pass is slow:** Set `JUDGE_ENABLED=false` in `.env` or pass `--no-judge` to the CLI.
 
