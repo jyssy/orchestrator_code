@@ -108,11 +108,12 @@ state are loaded deterministically before RAG context.
 **CLI reference:**
 ```sh
 uv run orchestrate work "your coding task" --repo-root /repo  # guarded Codex workflow
+uv run orchestrate plan "your coding task" --repo-root /repo  # standalone read-only plan
 uv run python cli.py ask "your prompt"                    # basic ask
 uv run python cli.py ask "your prompt" -f path/to/file    # include a file as context
 uv run python cli.py ask "your prompt" --repo-root /repo  # load AGENTS.md + repo RAG
 uv run python cli.py ask "your prompt" --no-judge         # skip critique pass (faster)
-uv run python cli.py ask "your prompt" --plan             # plan first, then approve
+uv run python cli.py ask "your prompt" --plan             # compatibility: plan, approve advice
 uv run python cli.py audit-index /path/to/dir             # safety scan; no API calls
 uv run python cli.py index /path/to/dir --rebuild         # sanitized full rebuild
 ```
@@ -121,8 +122,28 @@ uv run python cli.py index /path/to/dir --rebuild         # sanitized full rebui
 
 ## Daily usage patterns
 
-Use one of these two workflows. Do not let Codex and Copilot write to the same
-repository at the same time.
+Use the standalone planning action below, or one of the two implementation
+workflows. Do not let Codex and Copilot write to the same repository at the
+same time.
+
+### Standalone plan (no implementation)
+
+Generate a repository-aware plan without launching Codex, prompting for
+approval, or changing files:
+
+```sh
+cd /Users/jelambeadmin/Documents/orchestrator_code
+uv run orchestrate plan \
+  "describe the proposed coding or operations change" \
+  --repo-root /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
+```
+
+Use `--file` (or `-f`) to include one safe file from the target repository as
+additional context. The command loads effective `AGENTS.md` guidance and
+read-only Git state through the existing planning pipeline, prints the plan,
+and exits. Its output is a proposal, not implementation approval. Use
+`orchestrate work` when the intended workflow includes implementation after a
+separate human approval.
 
 ### 1. Codex CLI (recommended)
 
@@ -194,17 +215,19 @@ Codex CLI.
 uv run python cli.py ask "explain the dependency chain between CMS infra and PortalCMS Django" --no-judge
 ```
 
-### Conservative / ops tasks — plan first, approve before executing
+### Conservative / ops tasks — standalone planning
 ```sh
-# Shows: scope, proposed changes, what won't change, required checks, human gates, risks
-# Then asks: "Proceed with implementation? [y/N]"
-uv run python cli.py ask "add a --limit guard to the warehouse deploy playbook" \
-  --plan \
+# Shows: scope, proposed changes, what won't change, required checks, human gates, risks.
+# It exits without approval prompting or implementation.
+uv run orchestrate plan "add a --limit guard to the warehouse deploy playbook" \
   --repo-root access-sysops/Operations_Warehouse_Infrastructure \
   -f access-sysops/Operations_Warehouse_Infrastructure/ansible/apiserver_playbook.yml
 ```
 
-Set `PLAN_FIRST=true` in `.env` to make plan-gating the default for every `ask`.
+`ask --plan` and `PLAN_FIRST=true` remain available for compatibility when an
+advisory answer should be preceded by a plan and confirmation. Prefer
+`orchestrate plan` for plan-only output and `orchestrate work` for a guarded
+plan-to-implementation workflow.
 
 ### Safe coding tasks
 ```sh

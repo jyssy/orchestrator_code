@@ -36,8 +36,8 @@ def run(*args, **kwargs):
     return pipeline_run(*args, **kwargs)
 
 
-def plan(*args, **kwargs):
-    """Load the model pipeline only when an ask command actually needs it."""
+def run_plan(*args, **kwargs):
+    """Load the model pipeline only when a command needs a plan."""
     from orchestrator.pipeline import plan as pipeline_plan
 
     return pipeline_plan(*args, **kwargs)
@@ -108,6 +108,44 @@ def work(
         raise typer.Exit(completed.returncode)
 
 
+@app.command("plan")
+def plan_command(
+    prompt: str = typer.Argument(..., help="Coding task to plan without implementing"),
+    file: Path = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="Safe repository file to include as additional context",
+    ),
+    repo_root: Path = typer.Option(
+        None,
+        "--repo-root",
+        "-r",
+        help="Target repository or a directory inside it; defaults to the current directory",
+    ),
+):
+    """Generate a repository-aware implementation plan and exit without editing."""
+    try:
+        target = resolve_target_repo(repo_root)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    console.print(f"[bold cyan]Repository:[/bold cyan] {target}")
+    console.print("[dim]Generating a read-only plan...[/dim]")
+    proposal = run_plan(
+        prompt,
+        context_path=str(file) if file else None,
+        repo_root=str(target),
+    )
+    console.print(
+        Panel(
+            Markdown(proposal),
+            title="[bold yellow]Plan (no changes made)[/bold yellow]",
+            border_style="yellow",
+        )
+    )
+
+
 @app.command()
 def ask(
     prompt: str = typer.Argument(..., help="Your question or task"),
@@ -126,7 +164,7 @@ def ask(
     # Plan-first mode: propose changes, gate on approval
     if plan_only or os.getenv("PLAN_FIRST", "false").lower() == "true":
         console.print("[dim]Generating plan...[/dim]")
-        proposal = plan(
+        proposal = run_plan(
             prompt,
             context_path=ctx_path,
             repo_root=str(repo_root) if repo_root else None,
