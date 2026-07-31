@@ -151,7 +151,11 @@ def ask(
     prompt: str = typer.Argument(..., help="Your question or task"),
     file: Path = typer.Option(None, "--file", "-f", help="Path to a file to include as context"),
     no_judge: bool = typer.Option(False, "--no-judge", help="Skip the critique/revision pass"),
-    plan_only: bool = typer.Option(False, "--plan", help="Show a plan and ask for approval before executing"),
+    plan_only: bool = typer.Option(
+        False,
+        "--plan",
+        help="Show a plan and ask for confirmation before generating advice",
+    ),
     repo_root: Path = typer.Option(
         None,
         "--repo-root",
@@ -161,7 +165,7 @@ def ask(
     """Send a prompt through the full router → specialist → judge pipeline."""
     ctx_path = str(file) if file else None
 
-    # Plan-first mode: propose changes, gate on approval
+    # Compatibility plan-first mode for an advisory response.
     if plan_only or os.getenv("PLAN_FIRST", "false").lower() == "true":
         console.print("[dim]Generating plan...[/dim]")
         proposal = run_plan(
@@ -170,11 +174,11 @@ def ask(
             repo_root=str(repo_root) if repo_root else None,
         )
         console.print(Panel(Markdown(proposal), title="[bold yellow]Plan (no changes made)[/bold yellow]", border_style="yellow"))
-        approved = typer.confirm("\nProceed with implementation?", default=False)
+        approved = typer.confirm("\nProceed to the advisory response?", default=False)
         if not approved:
             console.print("[dim]Aborted — no changes made.[/dim]")
             raise typer.Exit()
-        console.print("[dim]Approved. Running implementation...[/dim]")
+        console.print("[dim]Confirmed. Generating the advisory response...[/dim]")
 
     console.print(f"[dim]Classifying prompt...[/dim]")
     result = run(

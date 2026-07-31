@@ -105,47 +105,160 @@ Retrieved chunks are labelled with their source and can be restricted to one Git
 repository with `--repo-root`. Effective `AGENTS.md` guidance and read-only Git
 state are loaded deterministically before RAG context.
 
-**CLI reference:**
+## Command directions and quick reference
+
+Choose the command based on the intended outcome:
+
+| Command | Use it for | Repository changes or side effects |
+|---|---|---|
+| `ask` | Read-only questions and analysis | No repository edits; may call configured model and RAG services |
+| `plan` | A structured, repository-aware plan | No repository edits, approval prompt, or executor launch |
+| `work` | A change that may be implemented | Launches the guarded plan → approval → executor workflow |
+| `audit-index` | Preview what is safe to index | Read-only safety scan; no model API or Chroma write |
+| `index` | Build or update the sanitized RAG index | Writes the local Chroma index and may call the embedding service |
+
+There are two supported ways to invoke the CLI:
+
 ```sh
-uv run orchestrate work "your coding task" --repo-root /repo  # guarded Codex workflow
-uv run orchestrate plan "your coding task" --repo-root /repo  # standalone read-only plan
-uv run python cli.py ask "your prompt"                    # basic ask
-uv run python cli.py ask "your prompt" -f path/to/file    # include a file as context
-uv run python cli.py ask "your prompt" --repo-root /repo  # load AGENTS.md + repo RAG
-uv run python cli.py ask "your prompt" --no-judge         # skip critique pass (faster)
-uv run python cli.py ask "your prompt" --plan             # compatibility: plan, approve advice
-uv run python cli.py audit-index /path/to/dir             # safety scan; no API calls
-uv run python cli.py index /path/to/dir --rebuild         # sanitized full rebuild
+# From /Users/jelambeadmin/Documents/orchestrator_code:
+uv run orchestrate --help
+
+# From any directory, including a target repository:
+/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/orchestrate --help
+```
+
+Use the absolute executable when working from another repository. The examples
+below define a short shell variable only to keep the commands readable:
+
+```sh
+ORCHESTRATE_BIN=/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/orchestrate
+```
+
+### Ask: read-only questions and analysis
+
+`ask` does not infer repository context from the current directory. Always pass
+`--repo-root` when the answer should include effective `AGENTS.md`, read-only Git
+state, and repository-scoped RAG context.
+
+```sh
+cd /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
+
+# Repository-aware question
+$ORCHESTRATE_BIN ask \
+  "explain how this application is deployed" \
+  --repo-root "$PWD"
+
+# Include one safe file from the repository as additional context
+$ORCHESTRATE_BIN ask \
+  "explain how this inventory controls deployment" \
+  --repo-root "$PWD" \
+  --file "$PWD/ansible/hosts"
+
+# Skip the critique/revision pass for a faster answer
+$ORCHESTRATE_BIN ask \
+  "summarize the dependency-management workflow" \
+  --repo-root "$PWD" \
+  --no-judge
+
+# Compatibility workflow: show a plan, request confirmation, then produce advice
+$ORCHESTRATE_BIN ask \
+  "describe how to refactor this component" \
+  --repo-root "$PWD" \
+  --plan
+```
+
+`ask --plan` does not launch a code executor. Prefer `plan` for plan-only output
+and `work` when implementation may follow approval. Setting `PLAN_FIRST=true`
+applies the same compatibility plan-and-confirm behavior to every `ask` call.
+
+### Plan: produce a plan without implementation
+
+`plan` infers the current Git repository when `--repo-root` is omitted. Passing
+it explicitly is recommended in scripts and documentation.
+
+```sh
+cd /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
+
+# Repository-aware plan
+$ORCHESTRATE_BIN plan \
+  "describe the proposed coding or operations change" \
+  --repo-root "$PWD"
+
+# Include one safe repository file as additional context
+$ORCHESTRATE_BIN plan \
+  "propose a narrowly scoped inventory change" \
+  --repo-root "$PWD" \
+  --file "$PWD/ansible/hosts"
+```
+
+The command prints the plan and exits. Its output is a proposal, not approval
+to implement it.
+
+### Work: guarded plan, approval, and implementation
+
+`work` infers the current Git repository when `--repo-root` is omitted.
+
+```sh
+cd /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
+
+# Start the guarded Codex workflow in the current repository
+$ORCHESTRATE_BIN work \
+  "describe the coding change and what done means"
+
+# Target a repository explicitly
+$ORCHESTRATE_BIN work \
+  "describe the coding change and what done means" \
+  --repo-root "$PWD"
+
+# Print the Codex launch command and guarded prompt without launching Codex
+$ORCHESTRATE_BIN work \
+  "describe the coding change and what done means" \
+  --repo-root "$PWD" \
+  --print-only
+
+# Generate the equivalent guarded prompt for VS Code Copilot Agent mode
+$ORCHESTRATE_BIN work \
+  "describe the coding change and what done means" \
+  --repo-root "$PWD" \
+  --executor copilot
+```
+
+### Audit or rebuild the RAG index
+
+Run `audit-index` before `index`. Use `--resume` only for an interrupted scan
+whose source has not changed.
+
+```sh
+# Read-only safety audit
+$ORCHESTRATE_BIN audit-index /Users/jelambeadmin/Documents/access-sysops
+
+# Sanitized full rebuild (safe default)
+$ORCHESTRATE_BIN index /Users/jelambeadmin/Documents/access-sysops --rebuild
+
+# Resume an interrupted scan only when its source is unchanged
+$ORCHESTRATE_BIN index /Users/jelambeadmin/Documents/access-sysops --resume
+```
+
+### Discover every option
+
+```sh
+$ORCHESTRATE_BIN --help
+$ORCHESTRATE_BIN ask --help
+$ORCHESTRATE_BIN plan --help
+$ORCHESTRATE_BIN work --help
+$ORCHESTRATE_BIN audit-index --help
+$ORCHESTRATE_BIN index --help
 ```
 
 ---
 
-## Daily usage patterns
+## Guarded implementation workflow details
 
-Use the standalone planning action below, or one of the two implementation
-workflows. Do not let Codex and Copilot write to the same repository at the
-same time.
+The command catalog above is the authoritative quick reference. The following
+sections explain what happens after invoking `work`. Do not let Codex and
+Copilot write to the same repository at the same time.
 
-### Standalone plan (no implementation)
-
-Generate a repository-aware plan without launching Codex, prompting for
-approval, or changing files:
-
-```sh
-cd /Users/jelambeadmin/Documents/orchestrator_code
-uv run orchestrate plan \
-  "describe the proposed coding or operations change" \
-  --repo-root /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
-```
-
-Use `--file` (or `-f`) to include one safe file from the target repository as
-additional context. The command loads effective `AGENTS.md` guidance and
-read-only Git state through the existing planning pipeline, prints the plan,
-and exits. Its output is a proposal, not implementation approval. Use
-`orchestrate work` when the intended workflow includes implementation after a
-separate human approval.
-
-### 1. Codex CLI (recommended)
+### Codex CLI (recommended)
 
 Change to the repository you want edited:
 
@@ -188,7 +301,7 @@ To preview the guarded prompt without launching Codex:
 uv run orchestrate work "your task" --repo-root /repo --print-only
 ```
 
-### 2. VS Code Copilot Agent mode
+### VS Code Copilot Agent mode
 
 Generate the equivalent prompt:
 
@@ -209,36 +322,6 @@ Copilot should then call `#ask_orchestrator` with the same `repo_root`, implemen
 the approved scope, run checks permitted by `AGENTS.md`, and provide the same
 structured handoff. If the Copilot MCP connection is unstable, use option 1,
 Codex CLI.
-
-### Read-only analysis (no approval needed)
-```sh
-uv run python cli.py ask "explain the dependency chain between CMS infra and PortalCMS Django" --no-judge
-```
-
-### Conservative / ops tasks — standalone planning
-```sh
-# Shows: scope, proposed changes, what won't change, required checks, human gates, risks.
-# It exits without approval prompting or implementation.
-uv run orchestrate plan "add a --limit guard to the warehouse deploy playbook" \
-  --repo-root access-sysops/Operations_Warehouse_Infrastructure \
-  -f access-sysops/Operations_Warehouse_Infrastructure/ansible/apiserver_playbook.yml
-```
-
-`ask --plan` and `PLAN_FIRST=true` remain available for compatibility when an
-advisory answer should be preceded by a plan and confirmation. Prefer
-`orchestrate plan` for plan-only output and `orchestrate work` for a guarded
-plan-to-implementation workflow.
-
-### Safe coding tasks
-```sh
-uv run python cli.py ask "write a Python helper to parse the warehouse API response envelope"
-```
-
-### Large file / whole-repo questions (uses gemma-4-31B-it, 262K context)
-```sh
-uv run python cli.py ask "summarise all the Ansible roles and what hosts they target" \
-  -f access-sysops/Operations_CMS_Infrastructure/ansible/application_playbook.yml
-```
 
 ---
 
