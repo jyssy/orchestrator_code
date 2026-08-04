@@ -121,5 +121,6 @@ def build_claude_command(task: str, repo_root: Path) -> list[str]:
         executable,
         "--permission-mode", "acceptEdits",
         "--mcp-config", str(mcp_config),
+        "--",  # stops --mcp-config from greedily consuming the prompt as a second config path
         build_codex_prompt(task, repo_root),
     ]

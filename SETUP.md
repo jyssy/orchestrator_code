@@ -458,15 +458,16 @@ orchestrator root — no manual registration needed for `--executor claude`.
 
 To also have the orchestrator available in interactive `claude` sessions
 (started directly without `orchestrate work`), add it to Claude Code's
-persistent settings:
+user-scoped settings (available from any directory):
 
 ```sh
-claude mcp add orchestrator \
+claude mcp add --scope user orchestrator \
   /Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/python \
   /Users/jelambeadmin/Documents/orchestrator_code/mcp_server.py
 ```
 
-Verify with `claude mcp list` in an interactive Claude Code session.
+Note: `claude mcp list` only shows servers in scope for the current directory.
+Run it from within a repo where the server is registered to confirm it appears.
 
 **Secret protection:** Create a `.claudeignore` at the root of any repo with
 sensitive material to block Claude Code's file tools from reading those paths:
