@@ -13,6 +13,7 @@ from orchestrator.security import sensitive_content_reason
 class Executor(str, Enum):
     CODEX = "codex"
     COPILOT = "copilot"
+    CLAUDE = "claude"
 
 
 def resolve_target_repo(value: str | Path | None) -> Path:
@@ -102,5 +103,23 @@ def build_codex_command(task: str, repo_root: Path) -> list[str]:
         "workspace-write",
         "--ask-for-approval",
         "on-request",
+        build_codex_prompt(task, repo_root),
+    ]
+
+
+def build_claude_command(task: str, repo_root: Path) -> list[str]:
+    """Return a shell-free Claude Code launch command with edit-approval permissions."""
+    executable = shutil.which("claude")
+    if executable is None:
+        raise ValueError(
+            "Claude Code CLI was not found on PATH. "
+            "Install with: npm install -g @anthropic-ai/claude-code"
+        )
+    # points to the orchestrator MCP server config for Claude Code CLI
+    mcp_config = Path(__file__).parent.parent / "claude-mcp.json"
+    return [
+        executable,
+        "--permission-mode", "acceptEdits",
+        "--mcp-config", str(mcp_config),
         build_codex_prompt(task, repo_root),
     ]

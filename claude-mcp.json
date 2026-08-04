@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "orchestrator": {
+      "command": "/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/python",
+      "args": ["/Users/jelambeadmin/Documents/orchestrator_code/mcp_server.py"],
+      "cwd": "/Users/jelambeadmin/Documents/orchestrator_code"
+    }
+  }
+}

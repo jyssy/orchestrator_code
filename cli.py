@@ -19,6 +19,7 @@ load_dotenv(Path(__file__).parent / ".env", override=False)  # shell env vars ta
 
 from orchestrator.workflow import (
     Executor,
+    build_claude_command,
     build_codex_command,
     build_codex_prompt,
     build_copilot_prompt,
@@ -68,10 +69,10 @@ def work(
     """Start the guarded orchestrator → approval → coding-agent workflow."""
     try:
         target = resolve_target_repo(repo_root)
-        if executor is Executor.CODEX:
-            prompt = build_codex_prompt(task, target)
-        else:
+        if executor is Executor.COPILOT:
             prompt = build_copilot_prompt(task, target)
+        else:
+            prompt = build_codex_prompt(task, target)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -89,21 +90,28 @@ def work(
         return
 
     try:
-        command = build_codex_command(task, target)
+        if executor is Executor.CLAUDE:
+            command = build_claude_command(task, target)
+        else:
+            command = build_codex_command(task, target)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
     if print_only:
         preview = [*command[:-1], "<guarded workflow prompt>"]
         console.print(f"[bold cyan]Command:[/bold cyan] {shlex.join(preview)}")
-        console.print(Panel(prompt, title="Initial Codex prompt", border_style="blue"))
+        console.print(Panel(prompt, title=f"Initial {executor.value} prompt", border_style="blue"))
         return
 
+    agent_name = executor.value.capitalize()
     console.print(
-        "[dim]Launching Codex. It must show the orchestrator plan and wait for "
+        f"[dim]Launching {agent_name}. It must show the orchestrator plan and wait for "
         "approval before editing.[/dim]"
     )
-    completed = subprocess.run(command, check=False)
+    run_kwargs: dict = {"check": False}
+    if executor is Executor.CLAUDE:
+        run_kwargs["cwd"] = str(target)
+    completed = subprocess.run(command, **run_kwargs)
     if completed.returncode:
         raise typer.Exit(completed.returncode)
 

@@ -105,25 +105,28 @@ Retrieved chunks are labelled with their source and can be restricted to one Git
 repository with `--repo-root`. Effective `AGENTS.md` guidance and read-only Git
 state are loaded deterministically before RAG context.
 
-## Quick Start — VS Code Copilot workflow
+## Quick Start — guarded coding workflow
 
-The most common workflow runs in three steps:
+Three executors are available:
+
+| Executor | Command | How it runs |
+|---|---|---|
+| **Codex** (default) | `orchestrate work "task"` | Terminal subprocess, fully automated |
+| **Claude Code** | `orchestrate work "task" --executor claude` | Terminal subprocess, fully automated |
+| **VS Code Copilot** | `orchestrate work "task" --executor copilot` | Prints prompt — paste into VS Code |
+
+All three follow the same guarded workflow:
 
 ```sh
-# 1. Change to the repository you want to work in
 cd /path/to/your/repo
-
-# 2. Generate the guarded prompt (--repo-root is inferred from the current directory)
-uv run orchestrate work "describe the coding change and what done means" --executor copilot
-
-# 3. Copy the printed prompt and paste it into VS Code Copilot agent mode
+uv run orchestrate work "describe the coding change and what done means" --executor claude
 ```
 
-Copilot calls `#plan_task`, shows the plan, and stops without editing. After reviewing it:
+The agent calls `plan_task`, shows the plan, and stops without editing. After reviewing it:
 
 > Approved. Implement the plan. Preserve existing unrelated changes.
 
-Copilot then calls `#ask_orchestrator`, implements the approved scope, and reports the handoff.
+The agent calls `ask_orchestrator`, implements the approved scope, and reports the handoff.
 
 ---
 
@@ -223,22 +226,21 @@ to implement it.
 ```sh
 cd /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
 
-# Generate the guarded prompt for VS Code Copilot Agent mode (prints prompt; paste into Copilot)
+# Claude Code — fully automated subprocess (requires ANTHROPIC_API_KEY)
+$ORCHESTRATE_BIN work \
+  "describe the coding change and what done means" \
+  --executor claude
+
+# VS Code Copilot — prints prompt to paste into VS Code agent mode
 $ORCHESTRATE_BIN work \
   "describe the coding change and what done means" \
   --executor copilot
 
-# --repo-root is inferred from the current directory; pass it explicitly when needed
-$ORCHESTRATE_BIN work \
-  "describe the coding change and what done means" \
-  --repo-root "$PWD" \
-  --executor copilot
-
-# Start the guarded Codex workflow (requires Codex CLI installed)
+# Codex — fully automated subprocess (default; requires Codex CLI installed)
 $ORCHESTRATE_BIN work \
   "describe the coding change and what done means"
 
-# Preview the guarded prompt without launching Codex
+# Preview the guarded prompt without launching the executor
 $ORCHESTRATE_BIN work \
   "describe the coding change and what done means" \
   --repo-root "$PWD" \
@@ -277,8 +279,32 @@ $ORCHESTRATE_BIN index --help
 ## Guarded implementation workflow details
 
 The command catalog above is the authoritative quick reference. The following
-sections explain what happens after invoking `work`. Do not let Codex and
-Copilot write to the same repository at the same time.
+sections explain what happens after invoking `work`. Do not run two executors
+against the same repository at the same time.
+
+### Claude Code CLI (requires ANTHROPIC_API_KEY)
+
+From the target repository:
+
+```sh
+cd /path/to/your/repo
+uv run orchestrate work "describe the coding change and what done means" --executor claude
+```
+
+Claude Code launches as a subprocess in the repo directory, reads the effective
+`AGENTS.md`, calls `plan_task`, shows the plan, and stops without editing.
+After reviewing it, reply:
+
+> Approved. Implement the plan. Preserve existing unrelated changes.
+
+Claude Code calls `ask_orchestrator` with the same `repo_root`, implements the
+approved scope, runs permitted checks, and reports the handoff. File edits are
+auto-accepted; shell commands require your approval (`--permission-mode acceptEdits`).
+
+Requires `ANTHROPIC_API_KEY` in your environment. Add to `~/.zshrc`:
+```sh
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
 
 ### VS Code Copilot Agent mode
 
@@ -423,6 +449,35 @@ Contents:
 **Verify:**
 - In VS Code Copilot agent mode, type `#plan_task` or `#ask_orchestrator` — both should appear as available tools
 - Try: *"Use plan_task to propose how to refactor the contacts_updater.py file"*
+
+### Register with Claude Code CLI
+
+Claude Code CLI reads MCP config from a JSON file passed via `--mcp-config`.
+The orchestrator wires this automatically using `claude-mcp.json` in the
+orchestrator root — no manual registration needed for `--executor claude`.
+
+To also have the orchestrator available in interactive `claude` sessions
+(started directly without `orchestrate work`), add it to Claude Code's
+persistent settings:
+
+```sh
+claude mcp add orchestrator \
+  /Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/python \
+  /Users/jelambeadmin/Documents/orchestrator_code/mcp_server.py
+```
+
+Verify with `claude mcp list` in an interactive Claude Code session.
+
+**Secret protection:** Create a `.claudeignore` at the root of any repo with
+sensitive material to block Claude Code's file tools from reading those paths:
+```
+.env
+.env.*
+ansible/passwords.yml
+ansible/vault*
+*.tfstate
+*.tfstate.backup
+```
 
 ---
 
