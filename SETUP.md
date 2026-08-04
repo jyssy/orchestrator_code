@@ -79,7 +79,7 @@ cp .env.example .env
 uv sync
 
 # Test the CLI
-uv run python cli.py ask "write a Python function that retries an HTTP request 3 times"
+uv run orchestrate ask "write a Python function that retries an HTTP request 3 times"
 ```
 
 Expected output:
@@ -89,8 +89,8 @@ Expected output:
 
 **Audit, then build the RAG index** (run once, re-run after large changes):
 ```sh
-uv run python cli.py audit-index /Users/jelambeadmin/Documents/access-sysops
-uv run python cli.py index /Users/jelambeadmin/Documents/access-sysops --rebuild
+uv run orchestrate audit-index /Users/jelambeadmin/Documents/access-sysops
+uv run orchestrate index /Users/jelambeadmin/Documents/access-sysops --rebuild
 ```
 
 The audit makes no model calls. Indexing prunes generated environments and caches,
@@ -104,6 +104,28 @@ when the source tree has not changed.
 Retrieved chunks are labelled with their source and can be restricted to one Git
 repository with `--repo-root`. Effective `AGENTS.md` guidance and read-only Git
 state are loaded deterministically before RAG context.
+
+## Quick Start — VS Code Copilot workflow
+
+The most common workflow runs in three steps:
+
+```sh
+# 1. Change to the repository you want to work in
+cd /path/to/your/repo
+
+# 2. Generate the guarded prompt (--repo-root is inferred from the current directory)
+uv run orchestrate work "describe the coding change and what done means" --executor copilot
+
+# 3. Copy the printed prompt and paste it into VS Code Copilot agent mode
+```
+
+Copilot calls `#plan_task`, shows the plan, and stops without editing. After reviewing it:
+
+> Approved. Implement the plan. Preserve existing unrelated changes.
+
+Copilot then calls `#ask_orchestrator`, implements the approved scope, and reports the handoff.
+
+---
 
 ## Command directions and quick reference
 
@@ -201,26 +223,26 @@ to implement it.
 ```sh
 cd /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
 
-# Start the guarded Codex workflow in the current repository
-$ORCHESTRATE_BIN work \
-  "describe the coding change and what done means"
-
-# Target a repository explicitly
+# Generate the guarded prompt for VS Code Copilot Agent mode (prints prompt; paste into Copilot)
 $ORCHESTRATE_BIN work \
   "describe the coding change and what done means" \
-  --repo-root "$PWD"
+  --executor copilot
 
-# Print the Codex launch command and guarded prompt without launching Codex
-$ORCHESTRATE_BIN work \
-  "describe the coding change and what done means" \
-  --repo-root "$PWD" \
-  --print-only
-
-# Generate the equivalent guarded prompt for VS Code Copilot Agent mode
+# --repo-root is inferred from the current directory; pass it explicitly when needed
 $ORCHESTRATE_BIN work \
   "describe the coding change and what done means" \
   --repo-root "$PWD" \
   --executor copilot
+
+# Start the guarded Codex workflow (requires Codex CLI installed)
+$ORCHESTRATE_BIN work \
+  "describe the coding change and what done means"
+
+# Preview the guarded prompt without launching Codex
+$ORCHESTRATE_BIN work \
+  "describe the coding change and what done means" \
+  --repo-root "$PWD" \
+  --print-only
 ```
 
 ### Audit or rebuild the RAG index
@@ -258,7 +280,24 @@ The command catalog above is the authoritative quick reference. The following
 sections explain what happens after invoking `work`. Do not let Codex and
 Copilot write to the same repository at the same time.
 
-### Codex CLI (recommended)
+### VS Code Copilot Agent mode
+
+From the target repository:
+
+```sh
+cd /path/to/your/repo
+uv run orchestrate work "describe the coding change and what done means" --executor copilot
+```
+
+The command prints the guarded prompt — copy it and paste into VS Code Copilot agent mode.
+Copilot calls `#plan_task`, shows the plan, and stops without editing. After reviewing it, reply:
+
+> Approved. Implement the plan. Preserve existing unrelated changes.
+
+Copilot calls `#ask_orchestrator` with the same `repo_root`, implements the approved scope,
+runs checks permitted by `AGENTS.md`, and reports the handoff.
+
+### Codex CLI (requires Codex CLI on PATH)
 
 Change to the repository you want edited:
 
@@ -300,28 +339,6 @@ To preview the guarded prompt without launching Codex:
 ```sh
 uv run orchestrate work "your task" --repo-root /repo --print-only
 ```
-
-### VS Code Copilot Agent mode
-
-Generate the equivalent prompt:
-
-```sh
-cd /Users/jelambeadmin/Documents/orchestrator_code
-uv run orchestrate work \
-  "describe the coding change and what done means" \
-  --repo-root /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure \
-  --executor copilot
-```
-
-Copy the generated prompt into Copilot Agent mode. Copilot should call
-`#plan_task`, show the plan, and stop without editing. After reviewing it, reply:
-
-> Approved. Implement the plan. Preserve existing unrelated changes.
-
-Copilot should then call `#ask_orchestrator` with the same `repo_root`, implement
-the approved scope, run checks permitted by `AGENTS.md`, and provide the same
-structured handoff. If the Copilot MCP connection is unstable, use option 1,
-Codex CLI.
 
 ---
 
