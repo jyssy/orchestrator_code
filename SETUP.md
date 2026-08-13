@@ -78,6 +78,8 @@ cp .env.example .env
 # Create the uv virtual environment and install dependencies
 uv sync
 
+source .venv/bin/activate
+
 # Test the CLI
 uv run orchestrate ask "write a Python function that retries an HTTP request 3 times"
 ```
