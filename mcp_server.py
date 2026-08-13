@@ -61,7 +61,35 @@ def ask_orchestrator(
         judge_enabled=use_judge,
         effective_constraints=effective_constraints,
     )
+    if not result["final"]:
+        error = result.get("error") or {
+            "message": "The orchestration request did not produce an answer."
+        }
+        raise RuntimeError(error["message"])
     return result["final"]
+
+
+@mcp.tool(
+    timeout=300,
+    annotations={"readOnlyHint": True, "openWorldHint": True},
+)
+def ask_orchestrator_structured(
+    prompt: str,
+    context_path: str = "",
+    context_paths: list[str] | None = None,
+    repo_root: str = "",
+    use_judge: bool = True,
+    effective_constraints: str = "",
+) -> dict:
+    """Return the answer plus sanitized component statuses and warnings."""
+    return run(
+        prompt,
+        context_path=context_path or None,
+        context_paths=context_paths,
+        repo_root=repo_root or None,
+        judge_enabled=use_judge,
+        effective_constraints=effective_constraints,
+    )
 
 
 @mcp.tool(

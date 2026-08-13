@@ -4,6 +4,7 @@ import cli
 import mcp_server
 import orchestrator.judge as judge
 import orchestrator.pipeline as pipeline
+from orchestrator.results import ComponentResult, ResultStatus
 
 
 def test_judge_reads_environment_when_called(monkeypatch):
@@ -31,19 +32,31 @@ def test_explicit_setting_overrides_environment(monkeypatch):
 def test_pipeline_passes_per_call_judge_setting(monkeypatch):
     received = {}
 
-    monkeypatch.setattr(pipeline, "classify", lambda prompt: "coding")
     monkeypatch.setattr(
         pipeline,
-        "retrieve_context",
-        lambda prompt, repo_root=None: "",
+        "classify_result",
+        lambda prompt: ComponentResult("router", ResultStatus.SUCCESS, "coding"),
     )
-    monkeypatch.setattr(pipeline, "code", lambda prompt, context: "draft")
+    monkeypatch.setattr(
+        pipeline,
+        "retrieve_context_result",
+        lambda prompt, repo_root=None: ComponentResult(
+            "retrieval", ResultStatus.SUCCESS, ""
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "code_result",
+        lambda prompt, context: ComponentResult(
+            "specialist", ResultStatus.SUCCESS, "draft"
+        ),
+    )
 
     def fake_judge(prompt, draft, enabled=None, context=""):
         received["enabled"] = enabled
-        return draft
+        return ComponentResult("judge", ResultStatus.SUCCESS, draft)
 
-    monkeypatch.setattr(pipeline, "critique_and_revise", fake_judge)
+    monkeypatch.setattr(pipeline, "critique_and_revise_result", fake_judge)
 
     result = pipeline.run("prompt", judge_enabled=False)
 

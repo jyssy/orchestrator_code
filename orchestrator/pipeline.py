@@ -10,19 +10,32 @@ from orchestrator.approval import (
 )
 from orchestrator.context import (
     capture_repository_snapshot,
+    find_repo_root,
     load_explicit_context,
     load_git_state,
     load_policy_identity,
     resolve_repo_root,
     sanitize_effective_constraints,
 )
-from orchestrator.egress_guard import egress_scope, guard_text
-from orchestrator.judge import critique_and_revise
+from orchestrator.egress_guard import ModelEgressBlocked, egress_scope, guard_text
+from orchestrator.judge import critique_and_revise_result
+from orchestrator.model_gateway import ProviderFailure
 from orchestrator.models import PolicyIdentity, StructuredPlan
-from orchestrator.rag import retrieve_context
-from orchestrator.router import classify
-from orchestrator.security import load_data_classification, sensitive_content_reason
-from orchestrator.specialists import code, ops, reason, summarize
+from orchestrator.rag import retrieve_context_result
+from orchestrator.results import ComponentResult, ResultStatus, diagnostic
+from orchestrator.router import classify_result
+from orchestrator.security import (
+    DataClassification,
+    ModelEgressPolicyError,
+    load_data_classification,
+    sensitive_content_reason,
+)
+from orchestrator.specialists import (
+    code_result,
+    ops_result,
+    reason_result,
+    summarize_result,
+)
 
 _PLAN_SYSTEM = """You are a careful technical planner working in a multi-repository
 infrastructure and Django workspace.
@@ -81,6 +94,37 @@ def _normalize_context_paths(
     return paths
 
 
+def _request_data_classification(
+    repo_root: Path | None,
+    context_paths: list[str],
+) -> DataClassification:
+    """Return the most restrictive classification across all supplied repositories."""
+    classifications = [load_data_classification(repo_root)]
+    seen_roots = {repo_root} if repo_root else set()
+    for raw_path in context_paths:
+        nested_root = find_repo_root(raw_path)
+        if nested_root is not None and nested_root not in seen_roots:
+            classifications.append(load_data_classification(nested_root))
+            seen_roots.add(nested_root)
+
+    order = {
+        DataClassification.DENY_MODEL: 0,
+        DataClassification.LOCAL_ONLY: 1,
+        DataClassification.REMOTE_APPROVED: 2,
+    }
+    return min(classifications, key=order.__getitem__)
+
+
+def _request_policy_roots(repo_root: Path, context_paths: list[str]) -> list[Path]:
+    """Return every repository whose egress policy contributes to the request."""
+    roots = [repo_root]
+    for raw_path in context_paths:
+        nested_root = find_repo_root(raw_path)
+        if nested_root is not None and nested_root not in roots:
+            roots.append(nested_root)
+    return roots
+
+
 def _build_context(
     prompt: str,
     *,
@@ -88,6 +132,7 @@ def _build_context(
     context_path: str | None,
     context_paths: list[str] | None,
     effective_constraints: str | None = None,
+    component_results: list[ComponentResult[object]] | None = None,
 ) -> tuple[str, Path | None, PolicyIdentity]:
     paths = _normalize_context_paths(context_path, context_paths)
     resolved_root = resolve_repo_root(repo_root, paths)
@@ -99,6 +144,7 @@ def _build_context(
             resolved_root,
             target_path=target,
             effective_constraints=effective_constraints,
+            model_egress_roots=_request_policy_roots(resolved_root, paths),
         )
         if guidance:
             guard_text(guidance, source="effective agent guidance")
@@ -122,12 +168,14 @@ def _build_context(
         guard_text(explicit_context, source="explicit repository context")
         sections.append(explicit_context)
 
-    retrieved = retrieve_context(
+    retrieval_result = retrieve_context_result(
         prompt,
         repo_root=str(resolved_root) if resolved_root else None,
     )
-    if retrieved:
-        sections.append(retrieved)
+    if component_results is not None:
+        component_results.append(retrieval_result)
+    if retrieval_result.usable and retrieval_result.value:
+        sections.append(retrieval_result.value)
 
     return (
         "\n\n---\n\n".join(section for section in sections if section),
@@ -150,19 +198,29 @@ def plan(
     """
     paths = _normalize_context_paths(context_path, context_paths)
     resolved_root = resolve_repo_root(repo_root, paths)
-    classification = load_data_classification(resolved_root)
+    classification = _request_data_classification(resolved_root, paths)
     with egress_scope(classification):
         guard_text(prompt, source="user task")
+        components: list[ComponentResult[object]] = []
         context, _, _ = _build_context(
             prompt,
             repo_root=repo_root,
             context_path=context_path,
             context_paths=context_paths,
             effective_constraints=effective_constraints,
+            component_results=components,
         )
 
         plan_prompt = f"{_PLAN_SYSTEM}\n\nTask:\n{prompt}"
-        return reason(plan_prompt, context=context)
+        planning_result = reason_result(plan_prompt, context=context)
+        if planning_result.value is None:
+            raise ProviderFailure(
+                planning_result.status,
+                planning_result.code,
+                planning_result.message,
+                planning_result.attempts,
+            )
+        return planning_result.value
 
 
 def plan_structured(
@@ -190,17 +248,29 @@ def plan_structured(
     resolved_root = resolve_repo_root(repo_root, paths)
     if resolved_root is None:
         raise ValueError("A repository root is required for a structured plan")
-    classification = load_data_classification(resolved_root)
+    classification = _request_data_classification(resolved_root, paths)
     with egress_scope(classification):
         guard_text(task, source="user task")
+        components: list[ComponentResult[object]] = []
         context, resolved_root, policy = _build_context(
             prompt,
             repo_root=repo_root,
             context_path=context_path,
             context_paths=context_paths,
             effective_constraints=effective_constraints,
+            component_results=components,
         )
-        proposal = reason(f"{_PLAN_SYSTEM}\n\nTask:\n{prompt}", context=context)
+        planning_result = reason_result(
+            f"{_PLAN_SYSTEM}\n\nTask:\n{prompt}", context=context
+        )
+        if planning_result.value is None:
+            raise ProviderFailure(
+                planning_result.status,
+                planning_result.code,
+                planning_result.message,
+                planning_result.attempts,
+            )
+        proposal = planning_result.value
     constraints = sanitize_effective_constraints(effective_constraints)
     return StructuredPlan.create(
         task=task,
@@ -231,47 +301,203 @@ def run(
     Returns a dict with:
       task_type, context_used (bool), draft, final
     """
+    if not prompt.strip():
+        return _failure_response(
+            ResultStatus.INVALID_INPUT,
+            "empty_prompt",
+            "The request prompt must not be empty.",
+        )
+
+    try:
+        return _run_pipeline(
+            prompt,
+            context_path=context_path,
+            judge_enabled=judge_enabled,
+            context_paths=context_paths,
+            repo_root=repo_root,
+            effective_constraints=effective_constraints,
+        )
+    except ModelEgressBlocked:
+        return _failure_response(
+            ResultStatus.SECURITY_BLOCK,
+            "model_egress_blocked",
+            "The request was blocked by the model-egress security boundary.",
+        )
+    except ModelEgressPolicyError:
+        return _failure_response(
+            ResultStatus.INVALID_CONFIGURATION,
+            "invalid_model_egress_policy",
+            "The repository model-egress policy is invalid.",
+        )
+    except ProviderFailure as exc:
+        return _failure_response(exc.status, exc.code, exc.safe_message, exc.attempts)
+    except (OSError, TypeError, ValueError):
+        return _failure_response(
+            ResultStatus.INVALID_INPUT,
+            "invalid_request_context",
+            "The request or repository context is invalid.",
+        )
+    except Exception:  # noqa: BLE001 - public boundary must return a safe contract
+        return _failure_response(
+            ResultStatus.INTERNAL_FAILURE,
+            "pipeline_internal_failure",
+            "The orchestration pipeline failed unexpectedly.",
+        )
+
+
+def _failure_response(
+    status: ResultStatus,
+    code: str,
+    message: str,
+    attempts: int = 1,
+) -> dict:
+    component = ComponentResult(
+        "pipeline",
+        status,
+        code=code,
+        message=message,
+        attempts=attempts,
+    )
+    return {
+        "status": status.value,
+        "task_type": None,
+        "context_used": False,
+        "retrieval_used": False,
+        "repo_root": None,
+        "policy_fingerprint": None,
+        "draft": "",
+        "final": "",
+        "warnings": [],
+        "error": {"component": "pipeline", "code": code, "message": message},
+        "components": [component.public_summary()],
+    }
+
+
+def _run_pipeline(
+    prompt: str,
+    context_path: str | None,
+    judge_enabled: bool | None,
+    *,
+    context_paths: list[str] | None,
+    repo_root: str | None,
+    effective_constraints: str | None,
+) -> dict:
     paths = _normalize_context_paths(context_path, context_paths)
     requested_root = resolve_repo_root(repo_root, paths)
-    classification = load_data_classification(requested_root)
+    classification = _request_data_classification(requested_root, paths)
+    components: list[ComponentResult[object]] = []
+
     with egress_scope(classification):
         guard_text(prompt, source="user task")
+        route_result = classify_result(prompt)
+        components.append(route_result)
+        task_type = route_result.value
+        if task_type is None:
+            raise ProviderFailure(
+                route_result.status,
+                route_result.code,
+                route_result.message,
+                route_result.attempts,
+            )
 
-        # 1. Classify
-        task_type = classify(prompt)
-
-        # 2. Load effective policy, explicit files, Git state, and RAG
         context, resolved_root, policy = _build_context(
             prompt,
             repo_root=repo_root,
             context_path=context_path,
             context_paths=context_paths,
             effective_constraints=effective_constraints,
+            component_results=components,
         )
 
-        # 3. Route to specialist
         if task_type == "coding":
-            draft = code(prompt, context=context)
+            specialist_result = code_result(prompt, context=context)
         elif task_type == "ops":
-            draft = ops(prompt, context=context)
+            specialist_result = ops_result(prompt, context=context)
         elif task_type == "search":
-            draft = summarize(prompt, context=context)
+            specialist_result = summarize_result(prompt, context=context)
         else:
-            draft = reason(prompt, context=context)
+            specialist_result = reason_result(prompt, context=context)
+        components.append(specialist_result)
+        draft = specialist_result.value
+        if draft is None:
+            return _component_failure_response(
+                specialist_result,
+                task_type=task_type,
+                resolved_root=resolved_root,
+                policy=policy,
+                components=components,
+            )
 
-        # 4. Judge pass (critique + optional revision)
-        final = critique_and_revise(
+        judge_result = critique_and_revise_result(
             prompt,
             draft,
             enabled=judge_enabled,
             context=context,
         )
+        components.append(judge_result)
+        final = judge_result.value or draft
 
+    warnings = _public_warnings(components)
+    status = (
+        ResultStatus.DEGRADED_SUCCESS
+        if any(component.status is not ResultStatus.SUCCESS for component in components)
+        else ResultStatus.SUCCESS
+    )
+    retrieval = next(
+        (component for component in components if component.component == "retrieval"),
+        None,
+    )
     return {
+        "status": status.value,
         "task_type": task_type,
         "context_used": bool(context),
+        "retrieval_used": bool(retrieval and retrieval.value),
         "repo_root": str(resolved_root) if resolved_root else None,
         "policy_fingerprint": policy.fingerprint,
         "draft": draft,
         "final": final,
+        "warnings": warnings,
+        "error": None,
+        "components": [component.public_summary() for component in components],
     }
+
+
+def _component_failure_response(
+    failure: ComponentResult[object],
+    *,
+    task_type: str,
+    resolved_root: Path | None,
+    policy: PolicyIdentity,
+    components: list[ComponentResult[object]],
+) -> dict:
+    return {
+        "status": failure.status.value,
+        "task_type": task_type,
+        "context_used": False,
+        "retrieval_used": False,
+        "repo_root": str(resolved_root) if resolved_root else None,
+        "policy_fingerprint": policy.fingerprint,
+        "draft": "",
+        "final": "",
+        "warnings": _public_warnings(components),
+        "error": {
+            "component": failure.component,
+            "code": failure.code,
+            "message": failure.message,
+        },
+        "components": [component.public_summary() for component in components],
+    }
+
+
+def _public_warnings(
+    components: list[ComponentResult[object]],
+) -> list[dict[str, str]]:
+    warnings = []
+    for component in components:
+        component_warnings = component.warnings
+        if not component_warnings and component.status is not ResultStatus.SUCCESS:
+            component_warnings = (
+                diagnostic(component.component, component.code, component.message),
+            )
+        warnings.extend(warning.to_dict() for warning in component_warnings)
+    return warnings

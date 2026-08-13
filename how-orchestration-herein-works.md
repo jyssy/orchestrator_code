@@ -17,6 +17,24 @@ boundary that lets a coding agent discover and call the orchestrator's tools. It
 is not a job scheduler, message bus, deployment system, or infrastructure control
 plane.
 
+## Current Enhancement Status
+
+As of August 2026, three hardening increments are implemented:
+
+- **Phase 1 — enforced approval lifecycle:** content-addressed plan records,
+  single-use approval records, repository/policy drift checks, a separate
+  write-capable executor, and post-execution changed-path validation.
+- **Phase 2A — model-egress and secret protection:** mandatory local Gitleaks
+  scanning, repository egress classifications, a single guarded provider
+  gateway, nested-repository policy enforcement, and fail-closed handling.
+- **Phase 2B — fail-visible reliability:** typed component outcomes, sanitized
+  diagnostics, bounded transient-only remote retries, visible fallback states,
+  and additive structured CLI/MCP reporting.
+
+Phase 2B does not change the human approval steps or give the orchestrator write
+authority. Transactional RAG, a general model registry, deployment telemetry,
+and external-agent filesystem isolation remain future work.
+
 ## System at a Glance
 
 ```text
@@ -49,6 +67,10 @@ mcp_server.py / FastMCP
   |                           +-- select specialist model
   |                           +-- generate draft
   |                           +-- critique/revise draft
+  |                           +-- plain final text for legacy clients
+  |
+  +-- ask_orchestrator_structured
+  |                        -> same pipeline + sanitized status envelope
   |
   +-- audit_index ---------> safety scan only
   |
@@ -82,6 +104,7 @@ effective repository instructions.
 | --- | --- | --- |
 | MCP adapter | [`mcp_server.py`](mcp_server.py) | Exposes Python functions as MCP tools. |
 | Main pipeline | [`orchestrator/pipeline.py`](orchestrator/pipeline.py) | Builds context, routes requests, and coordinates the judge. |
+| Result contracts | [`orchestrator/results.py`](orchestrator/results.py) | Defines typed component statuses and sanitized diagnostics. |
 | Context loader | [`orchestrator/context.py`](orchestrator/context.py) | Resolves repositories and loads policy, Git state, and explicit files. |
 | Task router | [`orchestrator/router.py`](orchestrator/router.py) | Classifies prompts as coding, operations, search, or general. |
 | Model adapters | [`orchestrator/specialists.py`](orchestrator/specialists.py) | Assembles specialist messages without calling providers directly. |
@@ -119,7 +142,7 @@ equivalent client-side registrations described in [`SETUP.md`](SETUP.md).
 
 ### Exposed tools
 
-The server exposes six tools, including the four operational tools below and
+The server exposes seven tools, including the five operational tools below and
 the structured-plan validation tools described under approval enforcement.
 
 #### `plan_task`
@@ -142,6 +165,15 @@ Inputs are the same as `plan_task`, plus:
 
 The tool calls `pipeline.run()` and returns only the pipeline's final answer. It
 does not return the initial draft, classification, or other internal metadata.
+This text-returning behavior is preserved for existing MCP clients.
+
+#### `ask_orchestrator_structured`
+
+Inputs are identical to `ask_orchestrator`. It calls the same pipeline and
+returns the final answer together with sanitized overall status, per-component
+status, warnings, retry-attempt counts, and a safe error code when applicable.
+The diagnostic envelope contains no prompts, source chunks, credentials,
+provider bodies, scanner output, or unrestricted exception text.
 
 #### `audit_index`
 
@@ -259,11 +291,13 @@ After deterministic context is assembled, the pipeline asks the RAG subsystem
 for semantically related chunks. When `repo_root` is supplied, the vector query
 is filtered to chunks indexed with that exact repository root.
 
-RAG retrieval is optional. If the index is absent, empty, or inaccessible—or if
-an ordinary embedding/query failure occurs—the function returns an empty string
-and the pipeline continues without retrieved code. Egress-policy and scanner
-failures are not swallowed; they block the request. Legacy chunks without the
-current egress-policy version are ignored before reranking.
+RAG retrieval is optional. The result contract distinguishes an absent index,
+an empty index or valid zero-match query, stale-only chunks, dependency failure,
+and an internal retrieval failure. When the primary specialist can still answer,
+the pipeline continues without retrieved code and marks the overall response as
+degraded where appropriate. Egress-policy and scanner failures are not
+swallowed; they block the request. Legacy chunks without the current
+egress-policy version are rejected before reranking and reported as stale.
 
 ## Model-egress boundary
 
@@ -327,30 +361,39 @@ does not authorize implementation.
 
 ```text
 MCP request
-  -> mcp_server.ask_orchestrator()
+  -> mcp_server.ask_orchestrator() or ask_orchestrator_structured()
   -> pipeline.run()
-       1. classify(prompt)
-       2. _build_context()
-       3. call selected specialist
-       4. produce draft
-       5. critique_and_revise()
-  -> final answer returned through MCP
+       1. classify_result(prompt)
+       2. build context and retrieve_context_result()
+       3. call the selected specialist result function
+       4. produce a draft or an explicit failure
+       5. critique_and_revise_result()
+       6. aggregate component status and sanitized diagnostics
+  -> plain final text or structured result returned through MCP
 ```
 
 The complete internal result contains:
 
 ```python
 {
+    "status": "success | degraded_success | ...",
     "task_type": "coding | ops | search | general",
     "context_used": True | False,
+    "retrieval_used": True | False,
     "repo_root": "/resolved/repository/or/None",
     "draft": "initial specialist answer",
     "final": "original or judge-revised answer",
+    "warnings": [{"component": "...", "code": "...", "message": "..."}],
+    "error": None | {"component": "...", "code": "...", "message": "..."},
+    "components": [{"component": "...", "status": "...", "attempts": 1}],
 }
 ```
 
-The MCP wrapper exposes only `final`. The direct CLI can show the task type and
-can display both draft and revision when they differ.
+The compatibility MCP wrapper exposes only `final`. The structured MCP tool
+exposes the complete sanitized result, and the direct CLI prints overall status,
+safe warnings, task type, actual retrieval use, and draft/revision differences.
+Answer fields remain the model's verbatim output; only diagnostics are
+restricted to safe codes and fixed messages.
 
 ## Classification and Specialist Routing
 
@@ -396,10 +439,13 @@ REALMS requests use LiteLLM with an OpenAI-compatible endpoint. Configuration is
 read from environment variables after loading the repository `.env` without
 overriding variables already present in the shell.
 
-The coding specialist attempts the local coding model only when the REALMS call
-fails with a non-configuration exception. Missing credentials and explicit
-offline mode raise `RuntimeError` directly. Operations, search, planning,
-reasoning, and judge calls have no local generation fallback.
+The coding specialist attempts the local coding model only when the remote
+provider is transiently unavailable or remote transmission is explicitly denied
+while local model use remains allowed. Authentication, invalid request,
+malformed configuration, scanner, and policy failures do not trigger that
+fallback. Operations, search, planning, reasoning, and judge calls have no local
+generation fallback. Each path returns or propagates a typed, sanitized outcome
+rather than exposing a raw provider exception.
 
 ## The Judge Pass
 
@@ -421,6 +467,10 @@ MCP `use_judge` parameter makes the choice explicit.
 The judge improves the odds of a useful response but cannot guarantee accuracy.
 It is another model call and can miss or introduce errors. The executor must
 still verify model claims against the source before implementing anything.
+If critique or revision is unavailable, the pipeline retains the usable draft,
+marks the request as degraded, and reports a sanitized judge warning. A
+model-egress security block remains terminal and cannot be converted into a
+degraded success.
 
 ## RAG Indexing and Retrieval
 
@@ -483,8 +533,12 @@ For a prompt:
 4. REALMS reranks the candidates.
 5. Up to three chunks are added to model context with source path and offset.
 
-If reranking fails, the original candidate order is used. If retrieval as a
-whole fails, no RAG context is supplied and the main request continues.
+If reranking has a non-security failure, the original candidate order is used
+and the caller receives a `degraded_success` warning. A missing index,
+unavailable embedding/Chroma dependency, empty collection, no matches, and a
+stale policy-version index are distinct outcomes. The main request may continue
+without retrieved context, but its overall status records the degradation.
+Model-egress security blocks remain terminal rather than becoming empty context.
 
 ## Secret and Context Safety
 
@@ -531,11 +585,9 @@ and validates Git-visible changed paths after the process exits.
 
 Calls `pipeline.run()` directly. It can include one safe file, explicitly set a
 repository root, disable the judge, or use compatibility plan-first mode. It
-prints classification and whether the aggregate context string was non-empty.
-
-The label `RAG context: yes` is slightly imprecise: the boolean is true when any
-context exists, including Git state or agent guidance, even if RAG returned no
-chunks.
+prints classification, overall status, sanitized warnings, and whether retrieved
+RAG context was actually used. The separate internal `context_used` field still
+reports whether any deterministic or retrieved context was assembled.
 
 ### `orchestrate work`
 
@@ -695,13 +747,16 @@ which sections are present or how a model should cite them.
 
 ### MCP contract
 
-The public MCP contract consists of primitive arguments and a returned string.
-FastMCP derives each tool schema from the Python signature and docstring. There
-is no repository-defined protocol-buffer, REST, or domain-event schema.
+FastMCP derives each tool schema from the Python signature and docstring. The
+legacy `ask_orchestrator` contract still consists of primitive arguments and a
+returned final-answer string. The additive `ask_orchestrator_structured` tool
+uses the same arguments and returns the pipeline's JSON-compatible diagnostic
+envelope. There is no repository-defined protocol-buffer, REST, or domain-event
+schema.
 
-That simplicity makes the tools easy to call, but it means clients cannot
-programmatically distinguish warnings, evidence, model identity, retrieval
-status, or partial failure from ordinary prose.
+This split preserves existing clients while allowing new clients to distinguish
+warnings, component status, retries, retrieval use, and sanitized failures from
+ordinary answer prose.
 
 ### Context contract
 
@@ -737,10 +792,15 @@ instructions remains text within the same overall context.
 
 ### Result contract
 
-Internally, `pipeline.run()` separates draft and final output, but the MCP adapter
-collapses the result to one string. `pipeline.plan()` returns unvalidated
-Markdown. Required plan headings are requested through prompting rather than
-validated after generation.
+Internally, `pipeline.run()` separates draft and final output and aggregates
+typed `ComponentResult` values. Status values are `success`,
+`degraded_success`, `unavailable_dependency`, `invalid_input`,
+`invalid_configuration`, `security_block`, and `internal_failure`. Component
+summaries contain only component, status, code, fixed message, attempt count,
+and sanitized warning metadata. The legacy MCP adapter collapses this result to
+the final string; the structured adapter preserves it. `pipeline.plan()` still
+returns unvalidated Markdown. Required plan headings are requested through
+prompting rather than validated after generation.
 
 Phase 1 wraps an architect proposal in a typed, versioned record containing the
 exact task, repository snapshot, policy identity, allowed paths, prohibited
@@ -759,6 +819,8 @@ Configuration is environment-driven:
 | `OLLAMA_BASE_URL` | router and specialists | Local Ollama service URL. |
 | `OLLAMA_ROUTER_MODEL` | router | Local classification model. |
 | `OLLAMA_CODING_MODEL` | specialists | Local coding fallback model. |
+| `MODEL_REMOTE_MAX_ATTEMPTS` | model gateway | Bounded remote attempts for transient failures; default 3, valid range 1-5. |
+| `MODEL_RETRY_BASE_SECONDS` | model gateway | Exponential retry base delay; default 0.25 seconds, valid range 0-5. |
 | `JUDGE_ENABLED` | judge | Default judge behavior for calls without an explicit choice. |
 | `RAG_INDEX_PATH` | RAG | Persistent ChromaDB location. |
 | `RAG_EMBED_BATCH_SIZE` | RAG | Number of chunks embedded per batch. |
@@ -778,10 +840,11 @@ missing REALMS credential is normally discovered when a completion is attempted.
 ## Synchronous Execution and Failure Propagation
 
 All repository-defined stages are synchronous. One MCP tool invocation blocks
-while it performs context collection and remote model calls. The code itself
-defines no concurrency limits, retry policy, rate limiter, circuit breaker, or
-request cache; any concurrency behavior above it belongs to FastMCP or the MCP
-client.
+while it performs context collection and remote model calls. The model gateway
+defines bounded exponential retries for narrowly classified transient remote
+failures. The code defines no concurrency limit, rate limiter, circuit breaker,
+request cache, or cancellation propagation; any concurrency behavior above it
+belongs to FastMCP or the MCP client.
 
 Timeouts are unevenly applied:
 
@@ -797,18 +860,21 @@ Timeouts are unevenly applied:
 
 Failure behavior differs by stage:
 
-- Router failure degrades to keyword classification.
-- RAG reranking failure preserves the vector-search order.
-- Any broader RAG retrieval failure silently removes retrieved context.
+- Router failure degrades visibly to keyword classification.
+- RAG reranking failure preserves vector-search order with a warning.
+- Broader RAG failures are classified separately from valid zero-match results.
 - Git inspection failure is included as text in the context.
 - Rejected explicit context raises immediately.
-- Missing REALMS configuration raises immediately.
-- Unexpected coding-model failure may fall back to local Ollama.
-- Other specialist, planning, embedding, and judge failures normally propagate.
+- Missing or malformed REALMS/retry configuration is terminal and not retried.
+- Transient remote provider failures are retried within configured bounds.
+- Coding generation may fall back locally only under its explicit safe policy.
+- Judge unavailability retains a usable draft and marks the result degraded.
+- Scanner or model-egress policy blocks are terminal and never retried or
+  converted into an ordinary fallback.
 
-The broad exception handling in retrieval favors availability, but it hides
-whether the index was absent, filtering found nothing, the embedding service
-failed, or ChromaDB was unhealthy.
+Public failures use fixed codes and messages. Raw exception text, provider
+bodies, scanner output, prompts, credentials, and source chunks are excluded
+from the diagnostic contract.
 
 ## Trust Boundaries
 
@@ -843,23 +909,22 @@ write, deploy, access secrets, or expand scope.
 
 ## Engineering Improvement Opportunities
 
-The following changes would make the architecture easier to verify and safer to
-extend. They are recommendations, not claims about current behavior.
+This list records both delivered increments and remaining work so it is not
+mistaken for an implementation-status list.
 
-### 1. Return structured results
+### 1. Return structured results — Phase 2B partially delivered
 
-Define typed `PlanResult`, `ContextManifest`, and `AdviceResult` models. Preserve
-the draft, final answer, model route, retrieved sources, warnings, and degraded
-stages through MCP instead of returning one opaque string. Validate that plans
-contain the required scope, checks, gates, and risk fields.
+Typed component and pipeline outcomes, safe warnings, failure categories, and an
+additive structured MCP result are implemented. A typed context/evidence
+manifest and deterministic validation of model-generated plan prose remain
+future work.
 
-### 2. Bind approval to a specific plan and repository state
+### 2. Bind approval to a specific plan and repository state — Phase 1 delivered
 
-Generate a digest over the task, normalized repository root, Git commit, working
-tree summary, and structured plan. Require that digest—or a server-issued plan
-identifier—when requesting implementation advice. This would make plan-before-
-ask enforceable rather than purely procedural. The coding agent would still
-remain responsible for edits.
+The CLI lifecycle now binds task, normalized repository root, Git state, policy
+fingerprint, allowed paths, and structured plan content to a single-use approval
+record. Compatibility MCP calls remain advisory and independent by design. The
+coding agent remains responsible for edits and verification.
 
 ### 3. Make evidence visible and verifiable
 
@@ -875,12 +940,13 @@ distinct typed message sections with explicit trust labels. Add prompt-injection
 instructions for repository content, and never allow retrieved source text to
 override `AGENTS.md` or human constraints.
 
-### 5. Strengthen request-side secret controls
+### 5. Strengthen request-side secret controls — Phase 2A delivered
 
-The guarded `work` prompt validates task text, but direct MCP `plan_task` and
-`ask_orchestrator` calls do not call `_validate_task()`. Apply secret detection at
-the MCP boundary as well, and consider organization-specific detectors or a
-redaction layer before any prompt is transmitted externally.
+All model-capable paths cross the centralized fail-closed Gitleaks and egress
+policy boundary, including MCP-originated requests, provider payloads, RAG
+embedding/reranking, and the initial external-agent prompt. Organization-specific
+detectors and a physically isolated sanitized worktree remain optional stronger
+controls.
 
 ### 6. Make RAG updates content-addressed and atomic
 
@@ -889,12 +955,11 @@ atomically switch an alias after all embeddings succeed. That would make resume
 safe after content changes and prevent a failed rebuild from leaving a partially
 populated live collection.
 
-### 7. Surface degraded behavior
+### 7. Surface degraded behavior — Phase 2B delivered
 
-Replace silent RAG failure with structured warnings such as `index_missing`,
-`embedding_failed`, `rerank_failed`, or `no_repo_matches`. Correct the CLI's
-aggregate `RAG context` label so it reports deterministic and retrieved context
-separately.
+RAG outcomes now distinguish index absence, dependency failure, stale content,
+zero matches, and reranker fallback. CLI and structured MCP responses expose
+sanitized warnings and actual retrieval use separately from aggregate context.
 
 ### 8. Centralize validated configuration
 
@@ -903,11 +968,11 @@ credentials for enabled features, and inject settings into router, specialist,
 and RAG services. This would reduce import-time global state and make tests and
 runtime reconfiguration more predictable.
 
-### 9. Add explicit resilience controls
+### 9. Add explicit resilience controls — Phase 2B partially delivered
 
-Define completion and embedding timeouts, bounded retries for transient errors,
-rate limits, circuit breakers, and cancellation propagation from MCP. Record
-which attempt or fallback produced the final result without exposing secrets.
+Bounded transient-only remote retries and safe attempt/fallback diagnostics are
+implemented. Consistent per-operation timeouts, rate limits, circuit breakers,
+and cancellation propagation remain future operational work.
 
 ### 10. Improve routing confidence
 
@@ -923,19 +988,20 @@ before or after it: validate mentioned repository paths, commands, model names,
 and proposed write scope against the context manifest and policy. A second model
 alone cannot reliably detect hallucinated architecture.
 
-### 12. Add observability without leaking context
+### 12. Add observability without leaking context — diagnostic foundation delivered
 
-Introduce structured events for request ID, selected route, latency by stage,
-fallback use, chunk counts, and failure category. Do not log prompts, file
-contents, credentials, or raw model context. Metrics should distinguish model,
-retrieval, policy, and MCP failures.
+The result contract now supplies safe component, failure, fallback, and attempt
+metadata without sensitive payloads. Request IDs, latency events, aggregate
+metrics, and an external telemetry sink remain future work; any such sink must
+continue excluding prompts, file contents, credentials, and raw model context.
 
-### 13. Expand integration and contract tests
+### 13. Expand integration and contract tests — Phase 2B coverage added
 
-Add an in-process FastMCP test covering tool schemas and forwarding; test timeout
-and cancellation behavior; exercise classifier fallback; verify structured
-degradation when Chroma or REALMS is unavailable; and use fake model adapters to
-test end-to-end plan and answer contracts deterministically.
+Focused tests now cover transient retry bounds, non-retryable security and
+configuration paths, classifier fallback, retrieval state distinctions,
+reranker and pipeline degradation, diagnostic redaction, and legacy/structured
+MCP compatibility. Full in-process FastMCP schema, cancellation, and
+deployment-level integration tests remain future work.
 
 ## Failure Behavior and Important Limitations
 
@@ -955,9 +1021,10 @@ unrelated work.
 
 ### Context may be incomplete
 
-RAG can silently return nothing, policy text is size-limited, explicit files are
-truncated, and deeper directory guidance is loaded only when the target points
-there. A model answer may therefore be based on partial context.
+RAG can return no usable chunks with a visible status, policy text is
+size-limited, explicit files are truncated, and deeper directory guidance is
+loaded only when the target points there. A model answer may therefore be based
+on partial context even when diagnostics accurately describe retrieval state.
 
 ### Secret detection is intentionally narrow
 
@@ -971,12 +1038,14 @@ The local classifier and keyword fallback can choose the wrong specialist.
 Keyword ordering can dominate mixed prompts, and there is no second routing
 validation stage.
 
-### Fallback coverage is uneven
+### Fallback coverage is intentionally narrow
 
-Only coding generation has a local Ollama fallback for unexpected REALMS
-failures. Planning, operations, search, general reasoning, embeddings,
-reranking, and judging depend on REALMS, aside from their documented graceful
-retrieval behavior.
+Only coding generation has a local Ollama fallback, and only for a classified
+transient remote failure or a remote-transmission denial that still permits
+local model use. Planning, operations, search, general reasoning, embeddings,
+reranking, and judging depend on REALMS, aside from their documented degraded
+result behavior. Authentication, invalid request/configuration, scanner, and
+policy failures never activate a bypassing fallback.
 
 ### RAG resume assumes unchanged content
 
@@ -998,6 +1067,9 @@ The repository tests verify the most important boundaries:
   approval paths and requires a Git repository.
 - `test_workflow.py` verifies repository resolution, guarded prompt contents,
   Codex sandbox arguments, and rejection of secret material in task text.
+- `test_phase2b_reliability.py` checks bounded transient retries, terminal
+  security/configuration paths, visible component degradation, diagnostic
+  redaction, and legacy/structured MCP compatibility.
 
 These tests validate wiring and safety behavior with mocks. They do not make
 model correctness deterministic, and they do not turn the advisory orchestrator

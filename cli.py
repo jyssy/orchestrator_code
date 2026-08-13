@@ -383,8 +383,27 @@ def ask(
         effective_constraints=DEFAULT_EFFECTIVE_CONSTRAINTS,
     )
 
+    console.print(f"[bold cyan]Status:[/bold cyan] {result.get('status', 'success')}")
+    for warning in result.get("warnings", []):
+        console.print(
+            "[yellow]Warning "
+            f"({warning['component']}/{warning['code']}): {warning['message']}[/yellow]"
+        )
+    if not result["final"]:
+        error = result.get("error") or {
+            "code": "unknown_failure",
+            "message": "The request did not produce an answer.",
+        }
+        console.print(
+            f"[bold red]Error ({error['code']}):[/bold red] {error['message']}"
+        )
+        raise typer.Exit(2)
+
     console.print(f"[bold cyan]Task type:[/bold cyan] {result['task_type']}")
-    console.print(f"[bold cyan]RAG context:[/bold cyan] {'yes' if result['context_used'] else 'no'}")
+    console.print(
+        f"[bold cyan]RAG context:[/bold cyan] "
+        f"{'yes' if result.get('retrieval_used', result['context_used']) else 'no'}"
+    )
 
     if result["draft"] != result["final"]:
         console.print(Panel(Markdown(result["draft"]), title="Draft", border_style="yellow"))

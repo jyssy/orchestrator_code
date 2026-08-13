@@ -7,7 +7,8 @@ import os
 from typing import Literal
 
 from orchestrator.egress_guard import ModelEgressBlocked
-from orchestrator.model_gateway import ollama_generate
+from orchestrator.model_gateway import ProviderFailure, ollama_generate
+from orchestrator.results import ComponentResult, ResultStatus, diagnostic
 
 TaskType = Literal["coding", "ops", "general", "search"]
 
@@ -39,8 +40,8 @@ def _keyword_fallback(prompt: str) -> TaskType:
     return "general"
 
 
-def classify(prompt: str) -> TaskType:
-    """Return the task type for a given prompt."""
+def classify_result(prompt: str) -> ComponentResult[TaskType]:
+    """Return task classification with visible local-router degradation."""
     try:
         response = ollama_generate(
             base_url=_OLLAMA_BASE,
@@ -52,10 +53,74 @@ def classify(prompt: str) -> TaskType:
         )
         raw = response.json().get("response", "").strip().lower().split()[0]
         if raw in ("coding", "ops", "search", "general"):
-            return raw  # type: ignore[return-value]
-        return _keyword_fallback(prompt)
+            return ComponentResult("router", ResultStatus.SUCCESS, raw)
+        return ComponentResult(
+            "router",
+            ResultStatus.DEGRADED_SUCCESS,
+            _keyword_fallback(prompt),
+            code="router_invalid_response",
+            message="Local routing returned an invalid category; heuristics were used.",
+            warnings=(
+                diagnostic(
+                    "router",
+                    "router_invalid_response",
+                    "Local routing returned an invalid category; heuristics were used.",
+                ),
+            ),
+        )
     except ModelEgressBlocked:
         raise
-    except Exception:
-        # Ollama offline or model not pulled yet — use heuristics
-        return _keyword_fallback(prompt)
+    except ProviderFailure as exc:
+        return ComponentResult(
+            "router",
+            ResultStatus.DEGRADED_SUCCESS,
+            _keyword_fallback(prompt),
+            code="router_heuristic_fallback",
+            message="Local routing was unavailable; heuristics were used.",
+            attempts=exc.attempts,
+            warnings=(
+                diagnostic(
+                    "router",
+                    "router_heuristic_fallback",
+                    "Local routing was unavailable; heuristics were used.",
+                ),
+            ),
+        )
+    except (KeyError, IndexError, TypeError, ValueError):
+        return ComponentResult(
+            "router",
+            ResultStatus.DEGRADED_SUCCESS,
+            _keyword_fallback(prompt),
+            code="router_malformed_response",
+            message="Local routing response was malformed; heuristics were used.",
+            warnings=(
+                diagnostic(
+                    "router",
+                    "router_malformed_response",
+                    "Local routing response was malformed; heuristics were used.",
+                ),
+            ),
+        )
+    except Exception:  # noqa: BLE001 - local fallback is explicit and content-safe
+        return ComponentResult(
+            "router",
+            ResultStatus.DEGRADED_SUCCESS,
+            _keyword_fallback(prompt),
+            code="router_internal_fallback",
+            message="Local routing failed unexpectedly; heuristics were used.",
+            warnings=(
+                diagnostic(
+                    "router",
+                    "router_internal_fallback",
+                    "Local routing failed unexpectedly; heuristics were used.",
+                ),
+            ),
+        )
+
+
+def classify(prompt: str) -> TaskType:
+    """Compatibility wrapper returning only the selected task type."""
+    result = classify_result(prompt)
+    if result.value is None:
+        raise RuntimeError("Routing did not produce a task type")
+    return result.value

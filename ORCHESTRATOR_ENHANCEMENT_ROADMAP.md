@@ -74,7 +74,7 @@ behavioral convention rather than a technical boundary.
 - Reject execution if the repository base or approved policy has changed.
 - Compare the resulting diff with the approved path scope before handoff.
 
-**Likely components**
+**Implemented components**
 
 - `orchestrator/workflow.py`
 - `orchestrator/pipeline.py`
@@ -237,7 +237,16 @@ cross-repository lifecycle coupling.
 - Retrieval reports the repository and index version used.
 - Stale indexes are detected and reported.
 
-### 6. Replace silent degradation with structured results
+### 6. Replace silent degradation with structured results — delivered as Phase 2B
+
+**Current status (August 2026)**
+
+Delivered. The shared contract is implemented in `orchestrator/results.py`,
+provider failure classification and bounded retries live in
+`orchestrator/model_gateway.py`, and sanitized status propagation now covers
+routing, retrieval, reranking, specialist calls, judging, the pipeline, CLI, and
+MCP. The original text-returning `ask_orchestrator` contract remains compatible;
+`ask_orchestrator_structured` exposes the diagnostic envelope to new clients.
 
 **Problem**
 
@@ -249,21 +258,22 @@ result with no matches.
 
 - Define structured results for routing, retrieval, model calls, and judging.
 - Distinguish success, degraded success, unavailable dependency, invalid input,
-  and internal failure.
+  invalid configuration, security-policy block, and internal failure.
 - Use narrowly scoped exception handling.
-- Add bounded retries with jitter only for retryable failures.
-- Add timeouts and simple circuit-breaker behavior for remote services.
+- Add bounded exponential retries only for retryable remote failures.
 - Carry warnings into CLI, MCP, and final handoff output.
 - Never include credentials, raw source content, or full prompts in logs.
 
-**Likely components**
+**Implemented components**
 
 - `orchestrator/router.py`
 - `orchestrator/rag.py`
 - `orchestrator/specialists.py`
 - `orchestrator/judge.py`
 - `orchestrator/pipeline.py`
-- New shared result/error types in `orchestrator/models.py`
+- `orchestrator/model_gateway.py`
+- New shared result/error types in `orchestrator/results.py`
+- `cli.py` and `mcp_server.py`
 
 **Acceptance criteria**
 
@@ -271,6 +281,10 @@ result with no matches.
 - Reranker fallback is visible to the caller.
 - Model configuration errors are not retried as transient failures.
 - No broad exception path silently reports success.
+
+Circuit breakers, cancellation propagation, and deployment-grade telemetry
+remain deliberately deferred; they are separate operational enhancements, not
+part of Phase 2B's safe diagnostic contract.
 
 ### 7. Make offline and fallback behavior coherent
 

@@ -23,6 +23,23 @@ specialist completion, planning, judging, revision, embedding, and reranking all
 cross the same guard. The initial prompt used to launch Codex or Claude from the
 CLI is also guarded immediately before launch and before approval consumption.
 
+## Safe failure and retry behavior
+
+Phase 2B adds typed component outcomes and sanitized public diagnostics. The
+public status categories are success, degraded success, unavailable dependency,
+invalid input, invalid configuration, security-policy block, and internal
+failure. Diagnostic messages are fixed descriptions; they never include model
+prompts, repository chunks, credentials, provider request or response bodies,
+scanner output, or unrestricted exception text. Successful answer text is not
+silently rewritten as part of diagnostic sanitization.
+
+Only transient remote transport failures, rate limits, and selected server
+errors receive bounded retry attempts. Scanner findings or scanner failure,
+model-egress policy denial, authentication failure, invalid requests, and
+malformed configuration are terminal and cannot trigger a retry or fallback
+that bypasses the guard. Every provider attempt still crosses the centralized
+model-egress boundary before transmission.
+
 ## Repository classifications
 
 Each repository may define `.orchestrator-policy.toml`:

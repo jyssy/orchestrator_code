@@ -140,6 +140,12 @@ or launch a write-capable executor; those remain explicit client or CLI actions.
 MCP validation also does not consume an approval. Single-use enforcement belongs
 to the canonical approval record used by the CLI `execute` command.
 
+Phase 2B does not change this approval sequence. Existing executors may continue
+to call text-returning `ask_orchestrator` exactly as directed. Clients that need
+sanitized component status, warnings, or failure codes may additionally call
+`ask_orchestrator_structured`. Neither advisory tool creates, consumes, or
+expands an approval.
+
 ## Compatibility planning command
 
 `orchestrate work` now launches Codex or Claude in read-only planning mode.

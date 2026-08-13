@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import orchestrator.rag as rag
+from orchestrator.results import ComponentResult, ResultStatus
 from orchestrator.security import (
     matches_ignore_patterns,
     sensitive_content_reason,
@@ -104,7 +105,13 @@ def test_rebuild_stores_only_safe_repo_scoped_chunks(tmp_path, monkeypatch):
         "_embed",
         lambda texts: [[1.0, 0.0, 0.0] for _ in texts],
     )
-    monkeypatch.setattr(rag, "_rerank", lambda query, documents: list(range(len(documents))))
+    monkeypatch.setattr(
+        rag,
+        "_rerank_result",
+        lambda query, documents: ComponentResult(
+            "reranker", ResultStatus.SUCCESS, list(range(len(documents)))
+        ),
+    )
     monkeypatch.setattr(rag, "guard_text", lambda text, **kwargs: None)
 
     report = rag.index_directory(str(source), rebuild=True)

@@ -11,6 +11,7 @@ from orchestrator import (
     specialists,
 )
 from orchestrator.context import load_policy_identity, reload_policy_identity
+from orchestrator.results import ComponentResult, ResultStatus
 from orchestrator.security import (
     DataClassification,
     ModelEgressPolicyError,
@@ -180,9 +181,25 @@ def test_pipeline_scans_each_early_context_source(tmp_path, monkeypatch):
         "guard_text",
         lambda text, *, source, **kwargs: sources.append(source),
     )
-    monkeypatch.setattr(pipeline, "classify", lambda prompt: "coding")
-    monkeypatch.setattr(pipeline, "retrieve_context", lambda *args, **kwargs: "")
-    monkeypatch.setattr(pipeline, "code", lambda prompt, context: "draft")
+    monkeypatch.setattr(
+        pipeline,
+        "classify_result",
+        lambda prompt: ComponentResult("router", ResultStatus.SUCCESS, "coding"),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "retrieve_context_result",
+        lambda *args, **kwargs: ComponentResult(
+            "retrieval", ResultStatus.SUCCESS, ""
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "code_result",
+        lambda prompt, context: ComponentResult(
+            "specialist", ResultStatus.SUCCESS, "draft"
+        ),
+    )
 
     result = pipeline.run(
         "safe task",
@@ -199,6 +216,36 @@ def test_pipeline_scans_each_early_context_source(tmp_path, monkeypatch):
         "effective caller constraints",
         "explicit repository context",
     }.issubset(sources)
+
+
+def test_nested_context_uses_the_most_restrictive_repository_policy(tmp_path):
+    parent = tmp_path / "parent"
+    nested = parent / "nested"
+    nested.mkdir(parents=True)
+    (parent / ".git").mkdir()
+    (nested / ".git").mkdir()
+    (parent / ".orchestrator-policy.toml").write_text(
+        '[model_egress]\nclassification = "remote-approved"\n'
+    )
+    (nested / ".orchestrator-policy.toml").write_text(
+        '[model_egress]\nclassification = "local-only"\n'
+    )
+    context_file = nested / "context.py"
+    context_file.write_text("VALUE = 1")
+
+    assert pipeline._request_data_classification(
+        parent, [str(context_file)]
+    ) is DataClassification.LOCAL_ONLY
+
+    _, identity, constraints = load_policy_identity(
+        parent,
+        target_path=context_file,
+        model_egress_roots=[parent, nested],
+    )
+    (nested / ".orchestrator-policy.toml").write_text(
+        '[model_egress]\nclassification = "deny-model"\n'
+    )
+    assert reload_policy_identity(identity.sources, constraints) != identity
 
 
 def test_only_gateway_imports_provider_clients():

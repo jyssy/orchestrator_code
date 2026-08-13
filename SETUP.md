@@ -378,10 +378,11 @@ workflow and its current limitations.
 
 ## Phase 4 — MCP server (Codex and VS Code integration)
 
-The MCP server exposes six tools that Codex, VS Code Copilot, and other MCP
+The MCP server exposes seven tools that Codex, VS Code Copilot, and other MCP
 clients can call:
 
 - `ask_orchestrator` — routes a prompt through the full pipeline and returns the answer; pass `use_judge=false` for a faster single-pass response
+- `ask_orchestrator_structured` — runs the same pipeline and returns the answer plus sanitized status, component, warning, and error metadata
 - `plan_task` — generates a scoped plan (scope, changes, checks, human gates, risks) without executing anything
 - `plan_task_structured` — returns a versioned plan record without writing it
 - `validate_plan_approval` — checks supplied records against current repository and policy state
@@ -399,6 +400,9 @@ and current repository and policy state.
 human review, and later call `ask_orchestrator` with the same task, `repo_root`,
 and `effective_constraints`. That sequence remains advisory: MCP does not create
 or consume the canonical approval record and does not launch the executor.
+`ask_orchestrator` still returns the final answer as plain text for existing
+clients. Call `ask_orchestrator_structured` when the client must distinguish a
+normal result from degraded operation or a sanitized failure.
 
 **Optional diagnostic start:**
 ```sh
@@ -412,6 +416,15 @@ All model-capable MCP calls require Gitleaks. Remote calls also require the
 target repository's `.orchestrator-policy.toml` classification to be
 `remote-approved`. The policy and scanner block before routing, completion,
 embedding, reranking, judging, or revision reaches a provider.
+
+Remote provider calls retry only narrowly classified transient transport, rate
+limit, and server failures. The defaults are three attempts with exponential
+backoff, configurable with `MODEL_REMOTE_MAX_ATTEMPTS` (1-5) and
+`MODEL_RETRY_BASE_SECONDS` (0-5). Scanner findings or failures, policy denial,
+authentication failure, invalid requests, and invalid retry configuration are
+never retried. Public diagnostics contain fixed status and reason codes; they do
+not contain prompts, source chunks, credentials, provider bodies, scanner
+output, or unrestricted exception text.
 
 ### Register with Codex
 
@@ -432,6 +445,7 @@ enabled_tools = [
   "plan_task_structured",
   "validate_plan_approval",
   "ask_orchestrator",
+  "ask_orchestrator_structured",
   "audit_index",
 ]
 ```

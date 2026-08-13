@@ -20,7 +20,8 @@ import chromadb
 from dotenv import load_dotenv
 
 from orchestrator.egress_guard import ModelEgressBlocked, egress_scope, guard_text
-from orchestrator.model_gateway import embedding, rerank
+from orchestrator.model_gateway import ProviderFailure, embedding, rerank
+from orchestrator.results import ComponentResult, ResultStatus, diagnostic
 from orchestrator.security import (
     INDEXABLE_EXTENSIONS,
     MODEL_EGRESS_POLICY_FILENAME,
@@ -95,8 +96,8 @@ def _embed(texts: list[str]) -> list[list[float]]:
     return [item["embedding"] for item in response.data]
 
 
-def _rerank(query: str, documents: list[str]) -> list[int]:
-    """Return candidate indices ordered by relevance, with a stable fallback."""
+def _rerank_result(query: str, documents: list[str]) -> ComponentResult[list[int]]:
+    """Return ranked indices and make any stable-order fallback visible."""
     try:
         response = rerank(
             base_url=_BASE_URL,
@@ -108,7 +109,9 @@ def _rerank(query: str, documents: list[str]) -> list[int]:
             timeout=60.0,
         )
         results = response.json().get("results", [])
-        return [
+        if not isinstance(results, list) or not results:
+            raise ValueError("reranker results are missing")
+        indices = [
             item["index"]
             for item in sorted(
                 results,
@@ -116,10 +119,71 @@ def _rerank(query: str, documents: list[str]) -> list[int]:
                 reverse=True,
             )
         ]
+        if any(
+            not isinstance(index, int) or index < 0 or index >= len(documents)
+            for index in indices
+        ) or len(indices) != len(set(indices)):
+            raise ValueError("reranker indices are invalid")
+        return ComponentResult("reranker", ResultStatus.SUCCESS, indices)
     except ModelEgressBlocked:
         raise
-    except Exception:
-        return list(range(min(_FINAL_K, len(documents))))
+    except ProviderFailure as exc:
+        fallback = list(range(min(_FINAL_K, len(documents))))
+        failure_details = {
+            ResultStatus.UNAVAILABLE_DEPENDENCY: (
+                "reranker_unavailable_fallback",
+                "Reranking was unavailable; stable retrieval order was used.",
+            ),
+            ResultStatus.INVALID_CONFIGURATION: (
+                "reranker_invalid_configuration_fallback",
+                "Reranking configuration was invalid; stable retrieval order was used.",
+            ),
+            ResultStatus.INVALID_INPUT: (
+                "reranker_request_rejected_fallback",
+                "The reranking request was rejected; stable retrieval order was used.",
+            ),
+            ResultStatus.INTERNAL_FAILURE: (
+                "reranker_internal_fallback",
+                "Reranking failed unexpectedly; stable retrieval order was used.",
+            ),
+        }
+        code, message = failure_details.get(
+            exc.status,
+            (
+                "reranker_fallback",
+                "Reranking could not complete; stable retrieval order was used.",
+            ),
+        )
+        return ComponentResult(
+            "reranker",
+            ResultStatus.DEGRADED_SUCCESS,
+            fallback,
+            code=code,
+            message=message,
+            attempts=exc.attempts,
+            warnings=(diagnostic("reranker", code, message),),
+        )
+    except (KeyError, TypeError, ValueError):
+        fallback = list(range(min(_FINAL_K, len(documents))))
+        return ComponentResult(
+            "reranker",
+            ResultStatus.DEGRADED_SUCCESS,
+            fallback,
+            code="reranker_malformed_response",
+            message="Reranking returned malformed data; stable retrieval order was used.",
+            warnings=(
+                diagnostic(
+                    "reranker",
+                    "reranker_malformed_response",
+                    "Reranking returned malformed data; stable retrieval order was used.",
+                ),
+            ),
+        )
+
+
+def _rerank(query: str, documents: list[str]) -> list[int]:
+    """Compatibility wrapper returning only candidate indices."""
+    return _rerank_result(query, documents).value or []
 
 
 def _nearest_repo_root(path: Path, source: Path, cache: dict[Path, Path]) -> Path:
@@ -278,16 +342,29 @@ def scan_directory(source_dir: str) -> tuple[list[IndexFile], IndexReport]:
     return safe_files, report
 
 
-def retrieve_context(query: str, repo_root: str | None = None) -> str:
-    """Retrieve source-labelled context, optionally restricted to one repository."""
+def retrieve_context_result(
+    query: str, repo_root: str | None = None
+) -> ComponentResult[str]:
+    """Retrieve context with explicit no-match, stale, and unavailable states."""
     if not _INDEX_PATH.exists():
-        return ""
+        return ComponentResult(
+            "retrieval",
+            ResultStatus.UNAVAILABLE_DEPENDENCY,
+            code="rag_index_missing",
+            message="The local RAG index is unavailable.",
+        )
 
     try:
         client = chromadb.PersistentClient(path=str(_INDEX_PATH))
         collection = client.get_collection(_COLLECTION_NAME)
         if collection.count() == 0:
-            return ""
+            return ComponentResult(
+                "retrieval",
+                ResultStatus.SUCCESS,
+                "",
+                code="rag_no_matches",
+                message="The RAG index contains no matching context.",
+            )
 
         query_embedding = _embed([query])[0]
         query_args = {
@@ -304,7 +381,13 @@ def retrieve_context(query: str, repo_root: str | None = None) -> str:
         documents = results["documents"][0]
         metadatas = results["metadatas"][0]
         if not documents:
-            return ""
+            return ComponentResult(
+                "retrieval",
+                ResultStatus.SUCCESS,
+                "",
+                code="rag_no_matches",
+                message="The RAG query returned no matching context.",
+            )
 
         current_entries = [
             (document, metadata)
@@ -312,24 +395,76 @@ def retrieve_context(query: str, repo_root: str | None = None) -> str:
             if metadata.get("egress_policy_version") == _EGRESS_POLICY_VERSION
         ]
         if not current_entries:
-            return ""
+            return ComponentResult(
+                "retrieval",
+                ResultStatus.DEGRADED_SUCCESS,
+                "",
+                code="rag_index_stale",
+                message="Only stale RAG chunks were found; none were used.",
+                warnings=(
+                    diagnostic(
+                        "retrieval",
+                        "rag_index_stale",
+                        "Only stale RAG chunks were found; none were used.",
+                    ),
+                ),
+            )
         documents = [entry[0] for entry in current_entries]
         metadatas = [entry[1] for entry in current_entries]
 
-        ranked_indices = _rerank(query, documents)
+        rerank_result = _rerank_result(query, documents)
+        ranked_indices = rerank_result.value or []
         sections: list[str] = []
         for index in ranked_indices[:_FINAL_K]:
             source = metadatas[index].get("source", "(unknown source)")
             offset = metadatas[index].get("offset", 0)
             sections.append(
-                f"### Retrieved context: {source} (offset {offset})\n"
-                f"{documents[index]}"
+                f"### Retrieved context: {source} (offset {offset})\n{documents[index]}"
             )
-        return "\n\n---\n\n".join(sections)
+        context = "\n\n---\n\n".join(sections)
+        return ComponentResult(
+            "retrieval",
+            rerank_result.status,
+            context,
+            code=rerank_result.code,
+            message=rerank_result.message,
+            attempts=rerank_result.attempts,
+            warnings=rerank_result.warnings,
+        )
     except ModelEgressBlocked:
         raise
-    except Exception:
-        return ""
+    except ProviderFailure as exc:
+        return ComponentResult(
+            "retrieval",
+            exc.status,
+            code=exc.code,
+            message=exc.safe_message,
+            attempts=exc.attempts,
+        )
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, IndexError):
+        return ComponentResult(
+            "retrieval",
+            ResultStatus.UNAVAILABLE_DEPENDENCY,
+            code="rag_query_failed",
+            message="The local RAG index could not be queried.",
+        )
+    except Exception:  # noqa: BLE001 - expose a safe status, never raw index errors
+        return ComponentResult(
+            "retrieval",
+            ResultStatus.INTERNAL_FAILURE,
+            code="rag_internal_failure",
+            message="RAG retrieval failed unexpectedly.",
+        )
+
+
+def retrieve_context(query: str, repo_root: str | None = None) -> str:
+    """Compatibility wrapper returning context or a sanitized explicit failure."""
+    result = retrieve_context_result(query, repo_root)
+    if not result.usable:
+        raise ProviderFailure(
+            result.status, result.code, result.message, result.attempts
+        )
+    return result.value or ""
 
 
 def index_directory(
@@ -393,6 +528,15 @@ def index_directory(
     report.uploaded_chunks = total
     for start in range(0, total, _EMBED_BATCH_SIZE):
         batch_chunks = chunks[start : start + _EMBED_BATCH_SIZE]
+        batch_metadatas = metadatas[start : start + _EMBED_BATCH_SIZE]
+        for repo_root in {item["repo_root"] for item in batch_metadatas}:
+            if (
+                load_data_classification(Path(repo_root))
+                is not DataClassification.REMOTE_APPROVED
+            ):
+                raise ModelEgressBlocked(
+                    "Repository policy changed before RAG embedding transmission"
+                )
         with egress_scope(DataClassification.REMOTE_APPROVED):
             embeddings = _embed(batch_chunks)
         collection.upsert(

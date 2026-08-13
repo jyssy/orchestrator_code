@@ -23,6 +23,7 @@ from orchestrator.context import (
     reload_policy_identity,
 )
 from orchestrator.models import PolicyIdentity, RepositorySnapshot, StructuredPlan
+from orchestrator.results import ComponentResult, ResultStatus
 
 
 def make_plan(tmp_path, *, allowed_paths=("orchestrator/**",)):
@@ -158,8 +159,20 @@ def test_structured_planning_binds_constraints_policy_and_repository(
         received["context"] = context
         return "## Scope\nChange the approved files."
 
-    monkeypatch.setattr(pipeline, "reason", fake_reason)
-    monkeypatch.setattr(pipeline, "retrieve_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        pipeline,
+        "reason_result",
+        lambda prompt, context="": ComponentResult(
+            "specialist", ResultStatus.SUCCESS, fake_reason(prompt, context)
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "retrieve_context_result",
+        lambda *args, **kwargs: ComponentResult(
+            "retrieval", ResultStatus.SUCCESS, ""
+        ),
+    )
 
     plan = pipeline.plan_structured(
         "Add boundary checks",
