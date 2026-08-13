@@ -12,18 +12,21 @@ import hashlib
 import os
 import subprocess
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 import chromadb
-import httpx
-import litellm
 from dotenv import load_dotenv
 
+from orchestrator.egress_guard import ModelEgressBlocked, egress_scope, guard_text
+from orchestrator.model_gateway import embedding, rerank
 from orchestrator.security import (
     INDEXABLE_EXTENSIONS,
+    MODEL_EGRESS_POLICY_FILENAME,
+    DataClassification,
     excluded_directory,
+    load_data_classification,
     load_ignore_patterns,
     matches_ignore_patterns,
     sensitive_content_reason,
@@ -41,6 +44,7 @@ _FINAL_K = 3
 _CHUNK_SIZE = 1500
 _MAX_FILE_BYTES = 2_000_000
 _EMBED_BATCH_SIZE = int(os.getenv("RAG_EMBED_BATCH_SIZE", "32"))
+_EGRESS_POLICY_VERSION = 1
 
 
 @dataclass
@@ -48,6 +52,7 @@ class IndexFile:
     path: Path
     repo_root: Path
     text: str
+    classification: DataClassification
 
 
 @dataclass
@@ -81,9 +86,9 @@ class IndexReport:
 
 def _embed(texts: list[str]) -> list[list[float]]:
     """Embed safe texts via REALMS Qwen3-Embedding-8B."""
-    response = litellm.embedding(
+    response = embedding(
         model="openai/Qwen3-Embedding-8B",
-        input=texts,
+        texts=texts,
         api_base=_BASE_URL,
         api_key=_API_KEY,
     )
@@ -93,18 +98,15 @@ def _embed(texts: list[str]) -> list[list[float]]:
 def _rerank(query: str, documents: list[str]) -> list[int]:
     """Return candidate indices ordered by relevance, with a stable fallback."""
     try:
-        response = httpx.post(
-            f"{_BASE_URL}/rerank",
-            headers={"Authorization": f"Bearer {_API_KEY}"},
-            json={
-                "model": "Qwen3-Reranker-8B",
-                "query": query,
-                "documents": documents,
-                "top_n": _FINAL_K,
-            },
+        response = rerank(
+            base_url=_BASE_URL,
+            api_key=_API_KEY,
+            model="Qwen3-Reranker-8B",
+            query=query,
+            documents=documents,
+            top_n=_FINAL_K,
             timeout=60.0,
         )
-        response.raise_for_status()
         results = response.json().get("results", [])
         return [
             item["index"]
@@ -114,6 +116,8 @@ def _rerank(query: str, documents: list[str]) -> list[int]:
                 reverse=True,
             )
         ]
+    except ModelEgressBlocked:
+        raise
     except Exception:
         return list(range(min(_FINAL_K, len(documents))))
 
@@ -206,6 +210,9 @@ def scan_directory(source_dir: str) -> tuple[list[IndexFile], IndexReport]:
             if path.is_symlink():
                 report.skipped["symlinks"] += 1
                 continue
+            if path.name == MODEL_EGRESS_POLICY_FILENAME:
+                report.skipped["model-egress policy"] += 1
+                continue
             relative = path.relative_to(source)
             if matches_ignore_patterns(relative, ignore_patterns):
                 report.skipped["orchestratorignore"] += 1
@@ -224,6 +231,15 @@ def scan_directory(source_dir: str) -> tuple[list[IndexFile], IndexReport]:
         resolved = path.resolve()
         if resolved in git_ignored:
             report.skipped["gitignore"] += 1
+            continue
+        repo_root = _nearest_repo_root(resolved, source, root_cache)
+        try:
+            classification = load_data_classification(repo_root)
+        except ValueError:
+            report.skipped["invalid model-egress policy"] += 1
+            continue
+        if classification is not DataClassification.REMOTE_APPROVED:
+            report.skipped[f"model egress {classification.value}"] += 1
             continue
         try:
             if path.stat().st_size > _MAX_FILE_BYTES:
@@ -249,8 +265,9 @@ def scan_directory(source_dir: str) -> tuple[list[IndexFile], IndexReport]:
         safe_files.append(
             IndexFile(
                 path=resolved,
-                repo_root=_nearest_repo_root(resolved, source, root_cache),
+                repo_root=repo_root,
                 text=text,
+                classification=classification,
             )
         )
 
@@ -289,6 +306,16 @@ def retrieve_context(query: str, repo_root: str | None = None) -> str:
         if not documents:
             return ""
 
+        current_entries = [
+            (document, metadata)
+            for document, metadata in zip(documents, metadatas, strict=True)
+            if metadata.get("egress_policy_version") == _EGRESS_POLICY_VERSION
+        ]
+        if not current_entries:
+            return ""
+        documents = [entry[0] for entry in current_entries]
+        metadatas = [entry[1] for entry in current_entries]
+
         ranked_indices = _rerank(query, documents)
         sections: list[str] = []
         for index in ranked_indices[:_FINAL_K]:
@@ -299,6 +326,8 @@ def retrieve_context(query: str, repo_root: str | None = None) -> str:
                 f"{documents[index]}"
             )
         return "\n\n---\n\n".join(sections)
+    except ModelEgressBlocked:
+        raise
     except Exception:
         return ""
 
@@ -318,21 +347,6 @@ def index_directory(
     files, report = scan_directory(source_dir)
     report.rebuilt = rebuild
 
-    _INDEX_PATH.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(_INDEX_PATH))
-
-    if rebuild:
-        try:
-            client.delete_collection(_COLLECTION_NAME)
-        except Exception:
-            pass
-    collection = client.get_or_create_collection(_COLLECTION_NAME)
-    existing_ids = (
-        set()
-        if rebuild
-        else set(collection.get(include=[])["ids"])
-    )
-
     chunks: list[str] = []
     ids: list[str] = []
     metadatas: list[dict] = []
@@ -342,23 +356,45 @@ def index_directory(
         for offset in range(0, len(item.text), _CHUNK_SIZE):
             chunk = item.text[offset : offset + _CHUNK_SIZE]
             chunk_id = hashlib.sha256(f"{item.path}:{offset}".encode()).hexdigest()
-            if chunk_id not in existing_ids:
-                chunks.append(chunk)
-                ids.append(chunk_id)
-                metadatas.append(
-                    {
-                        "source": str(item.path),
-                        "source_root": source_root,
-                        "repo_root": str(item.repo_root),
-                        "offset": offset,
-                    }
-                )
+            chunks.append(chunk)
+            ids.append(chunk_id)
+            metadatas.append(
+                {
+                    "source": str(item.path),
+                    "source_root": source_root,
+                    "repo_root": str(item.repo_root),
+                    "offset": offset,
+                    "egress_policy_version": _EGRESS_POLICY_VERSION,
+                }
+            )
+
+    # Complete all mandatory local scans before mutating the persistent index.
+    for chunk in chunks:
+        guard_text(chunk, source="RAG index chunk")
+
+    _INDEX_PATH.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(_INDEX_PATH))
+
+    if rebuild:
+        try:
+            client.delete_collection(_COLLECTION_NAME)
+        except Exception:
+            pass
+    collection = client.get_or_create_collection(_COLLECTION_NAME)
+    existing_ids = set() if rebuild else set(collection.get(include=[])["ids"])
+
+    if existing_ids:
+        retained = [index for index, chunk_id in enumerate(ids) if chunk_id not in existing_ids]
+        chunks = [chunks[index] for index in retained]
+        ids = [ids[index] for index in retained]
+        metadatas = [metadatas[index] for index in retained]
 
     total = len(chunks)
     report.uploaded_chunks = total
     for start in range(0, total, _EMBED_BATCH_SIZE):
         batch_chunks = chunks[start : start + _EMBED_BATCH_SIZE]
-        embeddings = _embed(batch_chunks)
+        with egress_scope(DataClassification.REMOTE_APPROVED):
+            embeddings = _embed(batch_chunks)
         collection.upsert(
             documents=batch_chunks,
             embeddings=embeddings,

@@ -29,6 +29,10 @@ def test_orchestratorignore_patterns_support_negation():
 
 def test_scan_excludes_generated_ignored_and_sensitive_files(tmp_path):
     source = tmp_path / "workspace"
+    (source / ".git").mkdir(parents=True)
+    (source / ".orchestrator-policy.toml").write_text(
+        '[model_egress]\nclassification = "remote-approved"\n'
+    )
     safe_file = source / "repo" / "main.py"
     safe_file.parent.mkdir(parents=True)
     safe_file.write_text("def safe():\n    return True\n")
@@ -59,11 +63,37 @@ def test_scan_excludes_generated_ignored_and_sensitive_files(tmp_path):
     assert report.skipped["orchestratorignore"] == 1
 
 
+def test_scan_does_not_read_repository_content_without_remote_opt_in(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "repo"
+    source.mkdir()
+    (source / ".git").mkdir()
+    candidate = source / "main.py"
+    candidate.write_text("ordinary code")
+
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read(path):
+        if path == candidate:
+            raise AssertionError("local-only content was read")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read)
+    files, report = rag.scan_directory(str(source))
+
+    assert files == []
+    assert report.skipped["model egress local-only"] == 1
+
+
 def test_rebuild_stores_only_safe_repo_scoped_chunks(tmp_path, monkeypatch):
     source = tmp_path / "workspace"
     repo = source / "repo"
     repo.mkdir(parents=True)
     (repo / ".git").mkdir()
+    (repo / ".orchestrator-policy.toml").write_text(
+        '[model_egress]\nclassification = "remote-approved"\n'
+    )
     safe_file = repo / "main.py"
     safe_file.write_text("def indexed_function():\n    return 'safe'\n")
     (repo / "passwords.yml").write_text("excluded: true")
@@ -75,6 +105,7 @@ def test_rebuild_stores_only_safe_repo_scoped_chunks(tmp_path, monkeypatch):
         lambda texts: [[1.0, 0.0, 0.0] for _ in texts],
     )
     monkeypatch.setattr(rag, "_rerank", lambda query, documents: list(range(len(documents))))
+    monkeypatch.setattr(rag, "guard_text", lambda text, **kwargs: None)
 
     report = rag.index_directory(str(source), rebuild=True)
     context = rag.retrieve_context("indexed function", repo_root=str(repo))
@@ -89,3 +120,33 @@ def test_rebuild_stores_only_safe_repo_scoped_chunks(tmp_path, monkeypatch):
     resumed = rag.index_directory(str(source), rebuild=False)
     assert resumed.indexed_chunks == 1
     assert resumed.uploaded_chunks == 0
+
+
+def test_retrieval_rejects_legacy_chunks_without_current_policy_metadata(
+    tmp_path, monkeypatch
+):
+    index_path = tmp_path / "chroma"
+    monkeypatch.setattr(rag, "_INDEX_PATH", index_path)
+    monkeypatch.setattr(rag, "_embed", lambda texts: [[1.0, 0.0] for _ in texts])
+    monkeypatch.setattr(
+        rag,
+        "_rerank",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("stale documents reached reranking")
+        ),
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    client = rag.chromadb.PersistentClient(path=str(index_path))
+    collection = client.get_or_create_collection(rag._COLLECTION_NAME)
+    collection.add(
+        documents=["legacy unsafe candidate"],
+        embeddings=[[1.0, 0.0]],
+        ids=["legacy"],
+        metadatas=[
+            {"source": str(repo / "old.py"), "repo_root": str(repo), "offset": 0}
+        ],
+    )
+
+    assert rag.retrieve_context("candidate", repo_root=str(repo)) == ""

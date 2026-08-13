@@ -1,0 +1,5 @@
+[model_egress]
+# deny-model: no model receives repository data
+# local-only: only local models may receive repository data
+# remote-approved: local and configured remote models may receive scanned data
+classification = "local-only"

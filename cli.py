@@ -41,6 +41,7 @@ from orchestrator.workflow import (
     build_copilot_prompt,
     build_execution_command,
     build_execution_prompt,
+    guard_external_agent_prompt,
     resolve_target_repo,
     validate_execution_result,
 )
@@ -128,6 +129,11 @@ def work(
         console.print(f"[bold cyan]Command:[/bold cyan] {shlex.join(preview)}")
         console.print(Panel(prompt, title=f"Initial {executor.value} prompt", border_style="blue"))
         return
+
+    try:
+        guard_external_agent_prompt(command[-1], target)
+    except (RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
     agent_name = executor.value.capitalize()
     console.print(
@@ -291,6 +297,11 @@ def execute_command(
             )
         )
         return
+
+    try:
+        guard_external_agent_prompt(command[-1], target)
+    except (RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
     before_metadata = capture_path_metadata(target, before.changed_paths)
     try:

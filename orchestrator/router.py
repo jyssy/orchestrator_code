@@ -4,8 +4,10 @@ Falls back to keyword heuristics if Ollama is unavailable.
 """
 
 import os
-import httpx
 from typing import Literal
+
+from orchestrator.egress_guard import ModelEgressBlocked
+from orchestrator.model_gateway import ollama_generate
 
 TaskType = Literal["coding", "ops", "general", "search"]
 
@@ -40,22 +42,20 @@ def _keyword_fallback(prompt: str) -> TaskType:
 def classify(prompt: str) -> TaskType:
     """Return the task type for a given prompt."""
     try:
-        response = httpx.post(
-            f"{_OLLAMA_BASE}/api/generate",
-            json={
-                "model": _ROUTER_MODEL,
-                "system": _SYSTEM_PROMPT,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0, "num_predict": 5},
-            },
+        response = ollama_generate(
+            base_url=_OLLAMA_BASE,
+            model=_ROUTER_MODEL,
+            system=_SYSTEM_PROMPT,
+            prompt=prompt,
+            options={"temperature": 0, "num_predict": 5},
             timeout=10.0,
         )
-        response.raise_for_status()
         raw = response.json().get("response", "").strip().lower().split()[0]
         if raw in ("coding", "ops", "search", "general"):
             return raw  # type: ignore[return-value]
         return _keyword_fallback(prompt)
+    except ModelEgressBlocked:
+        raise
     except Exception:
         # Ollama offline or model not pulled yet — use heuristics
         return _keyword_fallback(prompt)

@@ -30,6 +30,10 @@ Coding agent (Codex, Copilot, or Claude Code)
   v
 mcp_server.py / FastMCP
   |
+  +-- model-egress policy + mandatory local Gitleaks scan
+  |                           |
+  |                           +-- fail closed before any provider call
+  |
   +-- plan_task ----------> pipeline.plan()
   |                           |
   |                           +-- effective AGENTS.md guidance
@@ -80,7 +84,10 @@ effective repository instructions.
 | Main pipeline | [`orchestrator/pipeline.py`](orchestrator/pipeline.py) | Builds context, routes requests, and coordinates the judge. |
 | Context loader | [`orchestrator/context.py`](orchestrator/context.py) | Resolves repositories and loads policy, Git state, and explicit files. |
 | Task router | [`orchestrator/router.py`](orchestrator/router.py) | Classifies prompts as coding, operations, search, or general. |
-| Model adapters | [`orchestrator/specialists.py`](orchestrator/specialists.py) | Sends requests to REALMS or the supported local Ollama fallback. |
+| Model adapters | [`orchestrator/specialists.py`](orchestrator/specialists.py) | Assembles specialist messages without calling providers directly. |
+| Model gateway | [`orchestrator/model_gateway.py`](orchestrator/model_gateway.py) | Owns every LiteLLM and HTTP model-provider call. |
+| Egress guard | [`orchestrator/egress_guard.py`](orchestrator/egress_guard.py) | Enforces repository classification and scans complete payloads. |
+| Scanner adapter | [`orchestrator/secret_scanner.py`](orchestrator/secret_scanner.py) | Runs local Gitleaks over stdin and exposes redacted metadata only. |
 | Judge | [`orchestrator/judge.py`](orchestrator/judge.py) | Critiques a draft and optionally requests one revision. |
 | RAG subsystem | [`orchestrator/rag.py`](orchestrator/rag.py) | Safety-scans, indexes, retrieves, and reranks repository text. |
 | Safety rules | [`orchestrator/security.py`](orchestrator/security.py) | Rejects sensitive paths/content and defines index exclusions. |
@@ -112,7 +119,8 @@ equivalent client-side registrations described in [`SETUP.md`](SETUP.md).
 
 ### Exposed tools
 
-The server exposes four tools:
+The server exposes six tools, including the four operational tools below and
+the structured-plan validation tools described under approval enforcement.
 
 #### `plan_task`
 
@@ -172,14 +180,15 @@ structured records carry the state needed for deterministic validation.
 ## Context Assembly
 
 Both planning and full-answer requests call `_build_context()` in
-`orchestrator/pipeline.py`. It constructs one string from up to five sources, in
-this order:
+`orchestrator/pipeline.py`. It constructs one string from a trust-boundary notice
+and up to five sources, in this order:
 
-1. Effective `AGENTS.md` guidance.
-2. Sanitized caller constraints, when supplied.
-3. Read-only Git state.
-4. Explicitly requested safe files.
-5. Repository-scoped RAG context.
+1. A notice that ordinary repository and RAG content is untrusted evidence.
+2. Effective `AGENTS.md` guidance.
+3. Sanitized caller constraints, when supplied.
+4. Read-only Git state.
+5. Explicitly requested safe files.
+6. Repository-scoped RAG context.
 
 The sections are separated by Markdown dividers before being passed to a model.
 
@@ -251,8 +260,35 @@ for semantically related chunks. When `repo_root` is supplied, the vector query
 is filtered to chunks indexed with that exact repository root.
 
 RAG retrieval is optional. If the index is absent, empty, or inaccessible—or if
-embedding/querying fails—the function returns an empty string and the pipeline
-continues without retrieved code.
+an ordinary embedding/query failure occurs—the function returns an empty string
+and the pipeline continues without retrieved code. Egress-policy and scanner
+failures are not swallowed; they block the request. Legacy chunks without the
+current egress-policy version are ignored before reranking.
+
+## Model-egress boundary
+
+Every Python provider call flows through `orchestrator/model_gateway.py`.
+`orchestrator/egress_guard.py` first checks the active repository classification
+and then invokes local Gitleaks on a deterministic serialization of the complete
+model-bound payload. Authentication values are used only as provider credentials
+and are excluded from model-content scanning and model messages.
+
+Repositories default to `local-only`. They must contain an explicit
+`.orchestrator-policy.toml` classification of `remote-approved` before content
+can reach REALMS or another configured remote service. `deny-model` blocks local
+and remote models. Invalid policy blocks use rather than guessing.
+
+Tasks, caller constraints, effective guidance, and explicit context also receive
+early source-aware scans. Index chunks are scanned before embedding. Retrieved
+documents and their query are scanned before reranking. The final completion
+scan covers the assembled system/user messages and any nested model-bound
+options, closing call-site bypasses.
+
+The initial prompt passed by the CLI to Codex or Claude is guarded immediately
+before subprocess launch. Subsequent file reads or provider calls performed by
+external agents and editor extensions are outside this Python boundary. See
+[`SECURITY.md`](SECURITY.md) for classifications, setup, limitations, and the
+sanitized-worktree requirement for stronger isolation.
 
 ## The Planning Flow
 

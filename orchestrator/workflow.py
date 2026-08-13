@@ -8,8 +8,9 @@ from pathlib import Path
 
 from orchestrator.approval import path_is_allowed
 from orchestrator.context import find_repo_root
+from orchestrator.egress_guard import egress_scope, guard_payload
 from orchestrator.models import RepositorySnapshot, StructuredPlan
-from orchestrator.security import sensitive_content_reason
+from orchestrator.security import load_data_classification, sensitive_content_reason
 
 
 class Executor(str, Enum):
@@ -188,6 +189,17 @@ def build_execution_command(plan: StructuredPlan, executor: Executor) -> list[st
     raise ValueError(
         "Copilot execution cannot be enforced from this CLI; use Codex or Claude"
     )
+
+
+def guard_external_agent_prompt(prompt: str, repo_root: Path) -> None:
+    """Authorize and scan the initial prompt immediately before agent launch."""
+    classification = load_data_classification(repo_root)
+    with egress_scope(classification):
+        guard_payload(
+            [prompt],
+            source="assembled external-agent prompt",
+            remote=True,
+        )
 
 
 def changed_paths_since(

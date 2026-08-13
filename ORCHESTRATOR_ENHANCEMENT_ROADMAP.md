@@ -191,6 +191,21 @@ context loading or remote embedding.
 
 ## Phase 2: Reliability and assurance
 
+### Phase 2A delivered: model-egress and secret-scanning boundary
+
+The first Phase 2 increment centralizes every Python model-provider call behind
+repository classification and mandatory local Gitleaks scanning. It adds
+redacted metadata-only failures, scans early context sources and final assembled
+payloads, requires explicit remote opt-in, labels repository/RAG content as
+untrusted evidence, and rejects legacy RAG chunks without current policy
+metadata. See `SECURITY.md`.
+
+This increment intentionally does not implement the transactional index,
+general capability registry, distributed workflow, deployment, or observability
+items below. It also cannot intercept independent file reads made by external
+coding agents; stronger isolation requires a sanitized worktree or OS/container
+filesystem boundary.
+
 ### 5. Make RAG updates transactional and repository-isolated
 
 **Problem**
@@ -288,7 +303,7 @@ consistent capability contract.
 - Every pipeline capability has an explicit fallback policy.
 - Responses identify degraded operation without exposing sensitive details.
 
-### 8. Strengthen content-security controls
+### 8. Continue strengthening content-security controls
 
 **Problem**
 
@@ -298,7 +313,7 @@ confidential artifact, or prompt-injection attempt.
 **Enhancement**
 
 - Keep the existing conservative filename, suffix, directory, and content rules.
-- Add optional integration with a maintained secret scanner.
+- Maintain and tune the mandatory Gitleaks integration delivered in Phase 2A.
 - Add optional entropy-based detection with tuned false-positive handling.
 - Treat repository text and RAG results as quoted evidence, never as policy.
 - Keep system policy, user intent, and repository content in clearly separated
@@ -316,7 +331,7 @@ confidential artifact, or prompt-injection attempt.
 **Acceptance criteria**
 
 - Instructions embedded in repository files cannot override effective policy.
-- Secret scanner failures default to a documented safe behavior.
+- Secret scanner failures remain fail-closed with redacted metadata-only errors.
 - Remote transmission can be disabled independently of local analysis.
 - Audit output contains paths and reasons only when policy permits them.
 

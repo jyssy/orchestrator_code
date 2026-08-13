@@ -68,6 +68,7 @@ Before starting a write-capable process, the command validates:
 - Plan and approval schema versions and content-derived identifiers.
 - Exact task, repository, base commit, and initial working-tree identity.
 - Effective repository guidance and caller-constraint fingerprint.
+- Effective repository model-egress policy, including an absent-policy state.
 - Whether the approval was previously consumed.
 
 Execution accepts only the canonical approval path printed by `approve`; copied
@@ -87,6 +88,12 @@ time. It never reads file contents for this working-tree fingerprint.
 Run `execute --print-only` immediately before real execution to validate the
 records and preview the exact command without consuming approval or launching
 the executor. Then rerun the same command without `--print-only`.
+
+Immediately before a real Codex or Claude launch—and before consuming the
+approval—the CLI authorizes the repository classification and scans the fully
+assembled initial agent prompt with Gitleaks. Missing scanner, scanner failure,
+or a classification other than `remote-approved` blocks launch. `--print-only`
+does not transmit a prompt and therefore does not invoke the scanner.
 
 ## Recovery behavior
 
@@ -155,6 +162,7 @@ does not attempt an automatic rollback because doing so could destroy unrelated
 work. Review the final diff and repository state before integrating changes.
 
 Later phases may add isolated worktrees or a narrower filesystem sandbox for
-pre-write path enforcement. Transactional RAG, model-registry changes, expanded
-secret scanning, distributed workflows, and observability are not part of this
-phase.
+pre-write path enforcement. Phase 2A now guards orchestrator model calls and the
+initial CLI-generated executor prompt, but it cannot scan later independent file
+reads by the external executor. Transactional RAG, general model-registry
+changes, distributed workflows, and observability remain out of scope.

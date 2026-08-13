@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import tomllib
+from enum import Enum
 from pathlib import Path
-
 
 INDEXABLE_EXTENSIONS = {
     ".cfg",
@@ -87,6 +88,73 @@ _HIGH_CONFIDENCE_SECRET_PATTERNS = {
     "GitHub token": re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),
     "Slack token": re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
 }
+
+MODEL_EGRESS_POLICY_FILENAME = ".orchestrator-policy.toml"
+_MAX_MODEL_EGRESS_POLICY_BYTES = 16_384
+
+
+class DataClassification(str, Enum):
+    """Repository data's maximum permitted model destination."""
+
+    DENY_MODEL = "deny-model"
+    LOCAL_ONLY = "local-only"
+    REMOTE_APPROVED = "remote-approved"
+
+
+class ModelEgressPolicyError(ValueError):
+    """Raised when a repository model-egress policy cannot be trusted."""
+
+
+def model_egress_policy_path(repo_root: Path) -> Path:
+    """Return the canonical per-repository model-egress policy path."""
+    return repo_root.expanduser().resolve() / MODEL_EGRESS_POLICY_FILENAME
+
+
+def load_model_egress_policy(
+    repo_root: Path | None,
+) -> tuple[str, DataClassification]:
+    """
+    Load validated policy text and the repository's model classification.
+
+    Missing policy is a safe, deterministic ``local-only`` default. An invalid
+    or unreadable policy is ambiguous and therefore blocks all model calls.
+    """
+    if repo_root is None:
+        return "", DataClassification.LOCAL_ONLY
+
+    policy_path = model_egress_policy_path(repo_root)
+    if policy_path.is_symlink():
+        raise ModelEgressPolicyError("Model-egress policy must not be a symlink")
+    if not policy_path.exists():
+        return "", DataClassification.LOCAL_ONLY
+    if not policy_path.is_file():
+        raise ModelEgressPolicyError("Model-egress policy is not a regular file")
+
+    try:
+        raw = policy_path.read_bytes()
+    except OSError as exc:
+        raise ModelEgressPolicyError("Model-egress policy could not be read") from exc
+    if len(raw) > _MAX_MODEL_EGRESS_POLICY_BYTES:
+        raise ModelEgressPolicyError("Model-egress policy exceeds 16,384 bytes")
+
+    try:
+        text = raw.decode("utf-8")
+        parsed = tomllib.loads(text)
+        section = parsed["model_egress"]
+        if set(parsed) != {"model_egress"} or not isinstance(section, dict):
+            raise TypeError
+        if set(section) != {"classification"}:
+            raise TypeError
+        return text, DataClassification(section["classification"])
+    except (KeyError, TypeError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ModelEgressPolicyError("Model-egress policy is malformed") from exc
+    except ValueError as exc:
+        raise ModelEgressPolicyError("Model-egress classification is invalid") from exc
+
+
+def load_data_classification(repo_root: Path | None) -> DataClassification:
+    """Return the validated repository model-egress classification."""
+    return load_model_egress_policy(repo_root)[1]
 
 
 def excluded_directory(path: Path) -> bool:

@@ -10,7 +10,10 @@ from pathlib import Path
 
 from orchestrator.models import PolicyIdentity, RepositorySnapshot
 from orchestrator.security import (
+    MODEL_EGRESS_POLICY_FILENAME,
     excluded_directory,
+    load_model_egress_policy,
+    model_egress_policy_path,
     sensitive_content_reason,
     sensitive_path_reason,
 )
@@ -146,11 +149,21 @@ def load_policy_identity(
     """Return guidance, its deterministic identity, and sanitized constraints."""
     constraints = sanitize_effective_constraints(effective_constraints)
     guidance = load_agent_guidance(repo_root, target_path)
-    sources = tuple(
+    guidance_sources = tuple(
         str(path.resolve()) for path in _agent_guidance_files(repo_root, target_path)
     )
+    egress_policy_path = model_egress_policy_path(repo_root)
+    egress_policy, _ = load_model_egress_policy(repo_root)
+    # Keep the policy path in the identity even when it does not yet exist so
+    # creating an explicit remote opt-in invalidates an already approved plan.
+    sources = (*guidance_sources, str(egress_policy_path))
     payload = json.dumps(
-        {"guidance": guidance, "sources": sources, "constraints": constraints},
+        {
+            "guidance": guidance,
+            "model_egress_policy": egress_policy,
+            "sources": sources,
+            "constraints": constraints,
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -167,9 +180,14 @@ def reload_policy_identity(
     """Recompute an existing plan's policy identity from the same sources."""
     constraints = sanitize_effective_constraints(effective_constraints)
     sections: list[str] = []
+    egress_policy = ""
     total_bytes = 0
     for raw_path in sources:
-        path = Path(raw_path).expanduser().resolve()
+        source_path = Path(raw_path).expanduser()
+        if source_path.name == MODEL_EGRESS_POLICY_FILENAME:
+            egress_policy, _ = load_model_egress_policy(source_path.parent.resolve())
+            continue
+        path = source_path.resolve()
         if not path.is_file():
             raise ValueError(f"Policy source is missing: {path}")
         remaining = _MAX_AGENT_BYTES - total_bytes
@@ -180,7 +198,12 @@ def reload_policy_identity(
         sections.append(f"### Effective agent guidance: {path}\n{content}")
     guidance = "\n\n".join(sections)
     payload = json.dumps(
-        {"guidance": guidance, "sources": sources, "constraints": constraints},
+        {
+            "guidance": guidance,
+            "model_egress_policy": egress_policy,
+            "sources": sources,
+            "constraints": constraints,
+        },
         sort_keys=True,
         separators=(",", ":"),
     )

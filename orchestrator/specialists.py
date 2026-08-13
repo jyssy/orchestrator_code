@@ -4,9 +4,12 @@ Each function maps to the best model for that task type.
 """
 
 import os
-import litellm
-from dotenv import load_dotenv
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+from orchestrator.egress_guard import ModelEgressBlocked, RemoteTransmissionDenied
+from orchestrator.model_gateway import completion
 
 load_dotenv(Path(__file__).parent.parent / ".env", override=False)  # shell vars win
 
@@ -31,11 +34,12 @@ def _realms(model: str, messages: list[dict], **kwargs) -> str:
         raise RuntimeError(
             "REALMS_API_KEY is not set. Export it in ~/.zshrc or add it to .env"
         )
-    response = litellm.completion(
+    response = completion(
         model=f"openai/{model}",
         messages=messages,
         api_base=_BASE_URL,
         api_key=_API_KEY,
+        remote=True,
         **kwargs,
     )
     return response.choices[0].message.content or ""
@@ -44,12 +48,15 @@ def _realms(model: str, messages: list[dict], **kwargs) -> str:
 def _local(model: str, messages: list[dict]) -> str:
     """Call a local Ollama model via litellm. Raises with a helpful message if not running."""
     try:
-        response = litellm.completion(
+        response = completion(
             model=f"ollama/{model}",
             messages=messages,
             api_base=_OLLAMA_BASE,
+            remote=False,
         )
         return response.choices[0].message.content or ""
+    except ModelEgressBlocked:
+        raise
     except Exception as e:
         raise RuntimeError(
             f"Ollama not running or model '{model}' not pulled.\n"
@@ -66,6 +73,10 @@ def code(prompt: str, context: str = "") -> str:
     messages.append({"role": "user", "content": prompt})
     try:
         return _realms(_CODING_MODEL, messages)
+    except RemoteTransmissionDenied:
+        # Only an explicit local-only policy triggers fallback. Scanner and
+        # secret failures use a different error and remain fail-closed.
+        return _local(_LOCAL_CODING, messages)
     except RuntimeError:
         raise  # surface key/config errors directly
     except Exception as realms_err:

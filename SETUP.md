@@ -10,6 +10,7 @@ Architecture: Local Ollama router (qwen2.5:1.5b) + REALMS specialist models
 - Apple M2, 16 GB unified memory
 - macOS with Homebrew installed
 - `uv` installed (`brew install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- Gitleaks installed locally (`brew install gitleaks`)
 - REALMS API key exported in `~/.zshrc`:
   ```sh
   export REALMS_API_KEY="your-key-here"
@@ -80,9 +81,31 @@ uv sync
 
 source .venv/bin/activate
 
-# Test the CLI
-uv run orchestrate ask "write a Python function that retries an HTTP request 3 times"
+# Confirm the mandatory local scanner is available
+gitleaks version
 ```
+
+Before repository content can be sent to REALMS, copy the example policy into
+that target repository and explicitly authorize the destination:
+
+```sh
+cp /path/to/orchestrator_code/.orchestrator-policy.example.toml \
+  /path/to/target-repository/.orchestrator-policy.toml
+# Edit classification to remote-approved only after reviewing SECURITY.md.
+```
+
+Then test a repository-aware model call:
+
+```sh
+uv run orchestrate ask \
+  "write a Python function that retries an HTTP request 3 times" \
+  --repo-root /path/to/target-repository
+```
+
+Missing policy defaults to `local-only`; `deny-model` blocks all model use.
+Invalid policy and any unavailable, timed-out, failed, or malformed Gitleaks
+result block the model call. See [`SECURITY.md`](SECURITY.md) for the complete
+classification and boundary model.
 
 Expected output:
 - `Task type: coding`
@@ -95,11 +118,13 @@ uv run orchestrate audit-index /path/to/workspace
 uv run orchestrate index /path/to/workspace --rebuild
 ```
 
-The audit makes no model calls. Indexing prunes generated environments and caches,
-honors Git ignores and `.orchestratorignore`, rejects secret-bearing paths and
-high-confidence secret content, and only then sends safe chunks to
-Qwen3-Embedding-8B. The sanitized index is stored in `~/.orchestrator/chroma`.
-`--rebuild` removes stale chunks from older scans.
+The audit makes no model calls. Indexing accepts only repositories explicitly
+classified `remote-approved`, prunes generated environments and caches, honors
+Git ignores and `.orchestratorignore`, rejects secret-bearing paths and content,
+and passes each chunk through Gitleaks before Qwen3-Embedding-8B. The sanitized
+index is stored in `~/.orchestrator/chroma`. Phase 2A retrieval rejects legacy
+chunks without current egress-policy metadata, so perform one authorized full
+`--rebuild` after upgrading. This implementation does not run that rebuild.
 Rebuild is the safe default. Use `--resume` only after an interrupted run and only
 when the source tree has not changed.
 
@@ -264,6 +289,10 @@ Plan records can contain model-generated text derived from repository context,
 along with task, path, policy-source, constraint, and approver metadata. Review
 them before sharing; do not commit them to the target repository.
 
+New plans also bind `.orchestrator-policy.toml` (including its absent state) into
+the policy fingerprint. Regenerate Phase 1 plan records after this upgrade.
+Changing repository classification after planning invalidates approval.
+
 ### Work: compatibility read-only planning
 
 `work` infers the current Git repository when `--repo-root` is omitted.
@@ -379,6 +408,11 @@ or consume the canonical approval record and does not launch the executor.
 Normally, do not start the server manually. A stdio MCP client starts and owns
 the process automatically.
 
+All model-capable MCP calls require Gitleaks. Remote calls also require the
+target repository's `.orchestrator-policy.toml` classification to be
+`remote-approved`. The policy and scanner block before routing, completion,
+embedding, reranking, judging, or revision reaches a provider.
+
 ### Register with Codex
 
 Codex CLI, the Codex IDE extension, and the desktop app share the MCP configuration
@@ -459,7 +493,7 @@ claude mcp add --scope user orchestrator \
 Note: `claude mcp list` only shows servers in scope for the current directory.
 Run it from within a repo where the server is registered to confirm it appears.
 
-**Secret protection:** Create a `.claudeignore` at the root of any repo with
+**Additional secret protection:** Create a `.claudeignore` at the root of any repo with
 sensitive material to block Claude Code's file tools from reading those paths:
 ```
 .env
@@ -469,6 +503,12 @@ ansible/vault*
 *.tfstate
 *.tfstate.backup
 ```
+
+This ignore file is defense in depth, not enforcement. The orchestrator guards
+its own model calls and the initial CLI-generated agent prompt, but it cannot
+intercept later file reads made independently by Claude, Codex, Copilot,
+Continue, or editor extensions. Use a sanitized worktree or OS/container file
+boundary when those tools must be unable to access secret-bearing files.
 
 ---
 
