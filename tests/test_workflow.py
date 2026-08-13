@@ -2,11 +2,16 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.models import PolicyIdentity, RepositorySnapshot, StructuredPlan
 from orchestrator.workflow import (
+    Executor,
     build_codex_command,
     build_codex_prompt,
     build_copilot_prompt,
+    build_execution_command,
+    build_execution_prompt,
     resolve_target_repo,
+    validate_execution_result,
 )
 
 
@@ -35,14 +40,12 @@ def test_workflow_prompts_lock_repo_approval_and_handoff(tmp_path):
         assert task in prompt
         assert str(repo) in prompt
         assert "plan_task" in prompt
-        assert "ask_orchestrator" in prompt
-        assert "same" in prompt
         assert "STOP" in prompt
+        assert "separate" in prompt
         assert "Do not commit" in prompt
-        assert "checks not run" in prompt
 
 
-def test_codex_command_uses_workspace_sandbox_and_initial_prompt(tmp_path, monkeypatch):
+def test_codex_planning_command_uses_read_only_sandbox(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     monkeypatch.setattr(
         "orchestrator.workflow.shutil.which",
@@ -56,7 +59,7 @@ def test_codex_command_uses_workspace_sandbox_and_initial_prompt(tmp_path, monke
         "-C",
         str(repo),
         "--sandbox",
-        "workspace-write",
+        "read-only",
         "--ask-for-approval",
         "on-request",
     ]
@@ -68,4 +71,86 @@ def test_workflow_rejects_high_confidence_secret_material(tmp_path):
         build_codex_prompt(
             "Use -----BEGIN PRIVATE KEY----- in the fixture",
             Path(tmp_path),
+        )
+
+
+def test_approved_execution_command_is_separate_and_write_capable(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.workflow.shutil.which",
+        lambda executable: f"/usr/local/bin/{executable}",
+    )
+    plan = StructuredPlan.create(
+        task="Fix the parser",
+        repository=RepositorySnapshot(str(tmp_path), "abc", "tree", ()),
+        policy=PolicyIdentity("policy", ()),
+        effective_constraints="Preserve unrelated work.",
+        allowed_paths=("orchestrator/**",),
+        prohibited_operations=("commit",),
+        required_checks=("pytest",),
+        proposal="Proposal text is advisory.",
+    )
+
+    command = build_execution_command(plan, Executor.CODEX)
+    prompt = build_execution_prompt(plan)
+
+    assert command[4] == "workspace-write"
+    assert command[-1] == prompt
+    assert plan.plan_id in prompt
+    assert "ask_orchestrator" in prompt
+    assert "orchestrator/**" in prompt
+    assert "Proposal text is advisory" not in prompt
+
+
+def test_execution_result_preserves_unrelated_preexisting_changes(tmp_path):
+    plan = StructuredPlan.create(
+        task="Add models",
+        repository=RepositorySnapshot(
+            str(tmp_path), "abc", "before", ("notes.txt",)
+        ),
+        policy=PolicyIdentity("policy", ()),
+        effective_constraints="",
+        allowed_paths=("orchestrator/**",),
+        prohibited_operations=("commit",),
+        required_checks=("pytest",),
+        proposal="Add the approved files.",
+    )
+    before = plan.repository
+    after = RepositorySnapshot(
+        str(tmp_path), "abc", "after", ("notes.txt", "orchestrator/models.py")
+    )
+
+    changed = validate_execution_result(
+        plan,
+        before,
+        after,
+        before_metadata={"notes.txt": (1, 2, 3)},
+        after_metadata={
+            "notes.txt": (1, 2, 3),
+            "orchestrator/models.py": (1, 10, 4),
+        },
+    )
+
+    assert changed == {"orchestrator/models.py"}
+
+
+def test_execution_result_rejects_out_of_scope_change(tmp_path):
+    plan = StructuredPlan.create(
+        task="Add models",
+        repository=RepositorySnapshot(str(tmp_path), "abc", "before", ()),
+        policy=PolicyIdentity("policy", ()),
+        effective_constraints="",
+        allowed_paths=("orchestrator/**",),
+        prohibited_operations=("commit",),
+        required_checks=("pytest",),
+        proposal="Add the approved files.",
+    )
+    after = RepositorySnapshot(str(tmp_path), "abc", "after", ("SETUP.md",))
+
+    with pytest.raises(ValueError, match="outside the approved scope"):
+        validate_execution_result(
+            plan,
+            plan.repository,
+            after,
+            before_metadata={},
+            after_metadata={"SETUP.md": (1, 10, 4)},
         )

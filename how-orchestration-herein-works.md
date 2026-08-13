@@ -151,33 +151,35 @@ tool is correctly annotated as mutating and destructive.
 It changes the vector index, not the source repository. The project instructions
 require an explicit request before this tool is called.
 
-### What MCP does not enforce
+### Approval enforcement and MCP
 
-MCP exposes callable functions; it does not enforce the human approval sequence.
-`plan_task` and `ask_orchestrator` are independent calls, and the server does not
-store a plan identifier or an approval record. A client can technically call
-`ask_orchestrator` without calling `plan_task` first.
+The compatibility `plan_task` and `ask_orchestrator` tools remain independent
+advisory calls. The Phase 1 interface adds `plan_task_structured` and
+`validate_plan_approval`, while explicit approval creation and write-capable
+execution remain CLI or client responsibilities.
 
-The plan-first boundary is enforced operationally by:
+The enforced CLI lifecycle adds a technical pre-execution boundary through:
 
-1. The instructions attached to the MCP server.
-2. The guarded prompts generated for coding agents.
-3. The coding agent's own sandbox and approval settings.
-4. The human explicitly approving the displayed plan.
+1. A versioned, content-addressed plan record.
+2. A separate, single-use human approval record.
+3. Base-commit, working-tree, and policy-fingerprint validation.
+4. A separate write-capable executor process.
+5. Post-execution Git-visible changed-path validation.
 
-The client must repeat the same task and `repo_root` after approval. There is no
-implicit conversational state shared between the two MCP calls.
+There is still no implicit conversational state shared between MCP calls. The
+structured records carry the state needed for deterministic validation.
 
 ## Context Assembly
 
 Both planning and full-answer requests call `_build_context()` in
-`orchestrator/pipeline.py`. It constructs one string from up to four sources, in
+`orchestrator/pipeline.py`. It constructs one string from up to five sources, in
 this order:
 
 1. Effective `AGENTS.md` guidance.
-2. Read-only Git state.
-3. Explicitly requested safe files.
-4. Retrieved RAG snippets.
+2. Sanitized caller constraints, when supplied.
+3. Read-only Git state.
+4. Explicitly requested safe files.
+5. Repository-scoped RAG context.
 
 The sections are separated by Markdown dividers before being passed to a model.
 
@@ -473,13 +475,21 @@ remain authoritative.
 
 ## CLI Paths Through the System
 
-The Typer CLI in `cli.py` exposes five operational commands.
+The Typer CLI in `cli.py` exposes planning, approval, execution, advisory, and
+RAG maintenance commands.
 
 ### `orchestrate plan`
 
-Resolves a Git root and calls `pipeline.plan()` directly. This does not use MCP
-because the CLI and pipeline run in the same Python process. It prints the plan
-and exits without an approval or execution path.
+Resolves a Git root and calls the pipeline directly. Without `--allow`, it keeps
+the Markdown-only compatibility behavior. With one or more `--allow` values, it
+creates a versioned plan record outside the target repository.
+
+### `orchestrate approve` and `orchestrate execute`
+
+`approve` validates current repository and policy state before creating a
+single-use approval record. `execute` validates the exact plan and approval,
+rechecks drift, consumes approval, launches a separate write-capable executor,
+and validates Git-visible changed paths after the process exits.
 
 ### `orchestrate ask`
 
@@ -493,8 +503,8 @@ chunks.
 
 ### `orchestrate work`
 
-This is the guarded implementation entry point. It resolves the target Git root,
-validates the task text, and then:
+This is now a compatibility read-only planning entry point. It resolves the
+target Git root, validates task text, and then:
 
 - Launches Codex by default.
 - Launches Claude Code when selected.
@@ -502,13 +512,10 @@ validates the task text, and then:
 - Prints the launch details without starting an agent with `--print-only`.
 
 The launched agent receives instructions to inspect the repository, call
-`plan_task`, stop for approval, call `ask_orchestrator` after approval, implement
-only approved work, and provide a complete handoff.
+`plan_task`, show the proposal, and stop. It cannot be elevated in place.
 
-Codex is launched in the target repository with `workspace-write` sandboxing and
-on-request approvals. Claude Code uses its configured MCP file and
-`acceptEdits` permission mode. Copilot receives the same workflow as text for the
-user to paste into Agent mode.
+Codex uses a read-only sandbox and Claude Code uses plan permission mode. Copilot
+receives the planning workflow as text for the user to paste into Agent mode.
 
 ### `orchestrate audit-index`
 
@@ -525,26 +532,21 @@ for an unchanged interrupted source scan.
 
 The intended end-to-end sequence is:
 
-1. A human gives a coding agent a task and exact repository root.
-2. The agent reads the effective repository guidance and inspects the workspace
-   without modifying it.
-3. The agent calls `plan_task` through MCP with the task and repository root.
-4. The MCP server builds repository context and sends a structured planning
-   prompt to the reasoning model.
-5. The MCP server returns the plan to the agent.
-6. The agent displays the plan and stops.
-7. The human approves, rejects, or narrows it in a separate message.
-8. After approval, the agent calls `ask_orchestrator` with the same task and exact
-   repository root.
-9. The pipeline classifies the request, gathers context, invokes a specialist,
-   and normally runs the judge.
-10. The final advisory answer returns through MCP.
-11. The agent compares the advice against repository source, policy, current Git
-    state, and the approved plan. Incorrect or speculative advice is discarded.
-12. The agent edits only the approved scope.
-13. The agent runs only checks allowed by the effective `AGENTS.md` guidance.
-14. The agent re-reads the final diff and reports files changed, checks and
-    results, checks not run, failures, assumptions, and unresolved risks.
+1. The human requests a structured plan with an exact repository and explicit
+   allowed paths.
+2. The planner loads policy and repository state read-only, obtains architect
+   advice, and writes the plan record outside the target repository.
+3. The human reviews the proposal and structured scope.
+4. `approve` verifies that repository and policy state are unchanged, then
+   creates a single-use approval record.
+5. `execute` revalidates the exact task, plan, repository, policy, and approval.
+6. The approval is consumed before a separate write-capable executor starts.
+7. The executor calls `ask_orchestrator` with the same task, repository root,
+   and effective caller constraints.
+8. The executor evaluates the advice, edits only approved paths, runs permitted
+   checks, and reports its handoff.
+9. The CLI rejects commits and validates final Git-visible changed paths against
+   the plan allowlist.
 
 The orchestrator is therefore the **architect and reviewer**, MCP is the
 **tool-call bridge**, the coding agent is the **executor**, and the human remains
@@ -704,9 +706,10 @@ collapses the result to one string. `pipeline.plan()` returns unvalidated
 Markdown. Required plan headings are requested through prompting rather than
 validated after generation.
 
-Consequently, downstream correctness depends on the coding agent reading and
-interpreting prose. There is no typed change set, check list, approval token, or
-evidence manifest.
+Phase 1 wraps an architect proposal in a typed, versioned record containing the
+exact task, repository snapshot, policy identity, allowed paths, prohibited
+operations, and required checks. The proposal remains model-generated prose,
+but approval and execution validation use the structured envelope.
 
 ## Configuration and Initialization
 
@@ -725,6 +728,7 @@ Configuration is environment-driven:
 | `RAG_EMBED_BATCH_SIZE` | RAG | Number of chunks embedded per batch. |
 | `RAG_SOURCE_DIRS` | context, CLI, and MCP | Default index source and possible policy workspace root. |
 | `PLAN_FIRST` | CLI | Enables compatibility plan-and-confirm behavior for `ask`. |
+| `ORCHESTRATOR_STATE_DIR` | approval workflow | User-local structured plan and approval record storage. |
 
 The `.env` file is loaded without overriding shell variables, so an exported
 value wins. Most settings become module-level constants at import time. Changing
@@ -905,10 +909,13 @@ Specialist and judge results are natural-language model output. Neither the MCP
 adapter nor the judge proves that cited files, packages, commands, or behaviors
 exist. Source inspection by the executor is mandatory.
 
-### Approval is procedural
+### Scope enforcement is post-execution
 
-The MCP service does not maintain approval state. Safety depends on the client
-following the guarded workflow and on the executor's sandbox and permissions.
+The CLI enforces approval before launching a write-capable executor and rejects
+stale or consumed approvals. Allowed-path validation occurs after the executor
+exits and covers Git-visible changes. It is not an operating-system path sandbox
+and does not automatically roll back violations, because rollback could destroy
+unrelated work.
 
 ### Context may be incomplete
 

@@ -91,8 +91,8 @@ Expected output:
 
 **Audit, then build the RAG index** (run once, re-run after large changes):
 ```sh
-uv run orchestrate audit-index /Users/jelambeadmin/Documents/access-sysops
-uv run orchestrate index /Users/jelambeadmin/Documents/access-sysops --rebuild
+uv run orchestrate audit-index /path/to/workspace
+uv run orchestrate index /path/to/workspace --rebuild
 ```
 
 The audit makes no model calls. Indexing prunes generated environments and caches,
@@ -113,22 +113,28 @@ Three executors are available:
 
 | Executor | Command | How it runs |
 |---|---|---|
-| **Codex** (default) | `orchestrate work "task"` | Terminal subprocess, fully automated |
-| **Claude Code** | `orchestrate work "task" --executor claude` | Terminal subprocess, fully automated |
-| **VS Code Copilot** | `orchestrate work "task" --executor copilot` | Prints prompt — paste into VS Code |
+| **Codex** (default) | `orchestrate work "task"` | Read-only planning subprocess |
+| **Claude Code** | `orchestrate work "task" --executor claude` | Read-only planning subprocess |
+| **VS Code Copilot** | `orchestrate work "task" --executor copilot` | Planning prompt only; not supported by enforced `execute` |
 
-All three follow the same guarded workflow:
+`work` is now the compatibility planning launcher. For an implementation, use
+the enforced three-step workflow:
 
 ```sh
-cd /path/to/your/repo
-uv run orchestrate work "describe the coding change and what done means" --executor claude
+orchestrate plan "describe the change" --repo-root /path/to/repo --allow 'src/**' --allow 'tests/**'
+
+# Copy the exact Plan record path printed above.
+PLAN_FILE=/exact/path/printed/by/plan
+orchestrate approve "$PLAN_FILE"
+
+# Copy the exact Approval record path printed by approve.
+APPROVAL_FILE=/exact/path/printed/by/approve
+orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --print-only
+orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --executor codex
 ```
 
-The agent calls `plan_task`, shows the plan, and stops without editing. After reviewing it:
-
-> Approved. Implement the plan. Preserve existing unrelated changes.
-
-The agent calls `ask_orchestrator`, implements the approved scope, and reports the handoff.
+See [`PLAN_APPROVAL_WORKFLOW.md`](PLAN_APPROVAL_WORKFLOW.md) for record formats,
+drift checks, constraints, scope validation, and limitations.
 
 ---
 
@@ -139,26 +145,28 @@ Choose the command based on the intended outcome:
 | Command | Use it for | Repository changes or side effects |
 |---|---|---|
 | `ask` | Read-only questions and analysis | No repository edits; may call configured model and RAG services |
-| `plan` | A structured, repository-aware plan | No repository edits, approval prompt, or executor launch |
-| `work` | A change that may be implemented | Launches the guarded plan → approval → executor workflow |
+| `plan` | A repository-aware plan; `--allow` creates a structured record | No target-repository edits or executor launch |
+| `approve` | Explicitly approve an unchanged structured plan | Writes a private user-local approval record |
+| `execute` | Launch Codex or Claude for a valid approval | Consumes approval and permits scoped repository edits |
+| `work` | Compatibility planning launcher | Launches an agent with read-only permissions |
 | `audit-index` | Preview what is safe to index | Read-only safety scan; no model API or Chroma write |
 | `index` | Build or update the sanitized RAG index | Writes the local Chroma index and may call the embedding service |
 
 There are two supported ways to invoke the CLI:
 
 ```sh
-# From /Users/jelambeadmin/Documents/orchestrator_code:
+# From the orchestrator repository:
 uv run orchestrate --help
 
 # From any directory, including a target repository:
-/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/orchestrate --help
+/path/to/orchestrator_code/.venv/bin/orchestrate --help
 ```
 
 Use the absolute executable when working from another repository. The examples
 below define a short shell variable only to keep the commands readable:
 
 ```sh
-ORCHESTRATE_BIN=/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/orchestrate
+ORCHESTRATE_BIN=/path/to/orchestrator_code/.venv/bin/orchestrate
 ```
 
 ### Ask: read-only questions and analysis
@@ -168,7 +176,7 @@ ORCHESTRATE_BIN=/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/orches
 state, and repository-scoped RAG context.
 
 ```sh
-cd /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
+cd /path/to/target-repository
 
 # Repository-aware question
 $ORCHESTRATE_BIN ask \
@@ -194,9 +202,11 @@ $ORCHESTRATE_BIN ask \
   --plan
 ```
 
-`ask --plan` does not launch a code executor. Prefer `plan` for plan-only output
-and `work` when implementation may follow approval. Setting `PLAN_FIRST=true`
-applies the same compatibility plan-and-confirm behavior to every `ask` call.
+`ask --plan` does not launch a code executor. Prefer `plan` for plan-only output,
+`work` for an interactive read-only planning agent, and `plan --allow` followed
+by `approve` and `execute` when implementation may follow. Setting
+`PLAN_FIRST=true` applies the compatibility plan-and-confirm advisory behavior
+to every `ask` call.
 
 ### Plan: produce a plan without implementation
 
@@ -204,7 +214,7 @@ applies the same compatibility plan-and-confirm behavior to every `ask` call.
 it explicitly is recommended in scripts and documentation.
 
 ```sh
-cd /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
+cd /path/to/target-repository
 
 # Repository-aware plan
 $ORCHESTRATE_BIN plan \
@@ -219,16 +229,49 @@ $ORCHESTRATE_BIN plan \
 ```
 
 The command prints the plan and exits. Its output is a proposal, not approval
-to implement it.
+to implement it. Add one or more `--allow` values to create a structured plan
+record suitable for the separate `approve` and `execute` commands.
 
-### Work: guarded plan, approval, and implementation
+### Approve and execute a structured plan
+
+The `plan --allow` command prints a plan ID and the exact plan-record path. Read
+the proposal and JSON record before continuing. Copy that path exactly:
+
+```sh
+PLAN_FILE=/exact/path/printed/by/plan
+$ORCHESTRATE_BIN approve "$PLAN_FILE" --approved-by reviewer-name
+```
+
+`approve` rechecks repository and policy state, then prints the canonical
+approval-record path. Copy that path exactly; copied approval files are rejected.
+Validate immediately before execution:
+
+```sh
+APPROVAL_FILE=/exact/path/printed/by/approve
+$ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" --print-only
+
+# Remove --print-only only after reviewing the validated command.
+$ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" --executor codex
+```
+
+Use `--executor claude` for Claude Code. Enforced execution does not support
+Copilot, even though the shared executor option currently appears in CLI help.
+If drift is reported, generate and approve a new plan. If execution fails or is
+interrupted, the approval stays consumed; inspect the repository before starting
+a newly planned and approved attempt. Scope failures are not rolled back.
+
+Plan records can contain model-generated text derived from repository context,
+along with task, path, policy-source, constraint, and approver metadata. Review
+them before sharing; do not commit them to the target repository.
+
+### Work: compatibility read-only planning
 
 `work` infers the current Git repository when `--repo-root` is omitted.
 
 ```sh
-cd /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
+cd /path/to/target-repository
 
-# Claude Code — fully automated subprocess (requires ANTHROPIC_API_KEY)
+# Claude Code — read-only planning subprocess
 $ORCHESTRATE_BIN work \
   "describe the coding change and what done means" \
   --executor claude
@@ -238,16 +281,19 @@ $ORCHESTRATE_BIN work \
   "describe the coding change and what done means" \
   --executor copilot
 
-# Codex — fully automated subprocess (default; requires Codex CLI installed)
+# Codex — read-only planning subprocess (default; requires Codex CLI installed)
 $ORCHESTRATE_BIN work \
   "describe the coding change and what done means"
 
-# Preview the guarded prompt without launching the executor
+# Preview the planning prompt without launching the planning agent
 $ORCHESTRATE_BIN work \
   "describe the coding change and what done means" \
   --repo-root "$PWD" \
   --print-only
 ```
+
+The planning process cannot be elevated into execution. Use the structured
+`plan --allow`, `approve`, and `execute` lifecycle for implementation.
 
 ### Audit or rebuild the RAG index
 
@@ -256,13 +302,13 @@ whose source has not changed.
 
 ```sh
 # Read-only safety audit
-$ORCHESTRATE_BIN audit-index /Users/jelambeadmin/Documents/access-sysops
+$ORCHESTRATE_BIN audit-index /path/to/workspace
 
 # Sanitized full rebuild (safe default)
-$ORCHESTRATE_BIN index /Users/jelambeadmin/Documents/access-sysops --rebuild
+$ORCHESTRATE_BIN index /path/to/workspace --rebuild
 
 # Resume an interrupted scan only when its source is unchanged
-$ORCHESTRATE_BIN index /Users/jelambeadmin/Documents/access-sysops --resume
+$ORCHESTRATE_BIN index /path/to/workspace --resume
 ```
 
 ### Discover every option
@@ -271,6 +317,8 @@ $ORCHESTRATE_BIN index /Users/jelambeadmin/Documents/access-sysops --resume
 $ORCHESTRATE_BIN --help
 $ORCHESTRATE_BIN ask --help
 $ORCHESTRATE_BIN plan --help
+$ORCHESTRATE_BIN approve --help
+$ORCHESTRATE_BIN execute --help
 $ORCHESTRATE_BIN work --help
 $ORCHESTRATE_BIN audit-index --help
 $ORCHESTRATE_BIN index --help
@@ -280,113 +328,48 @@ $ORCHESTRATE_BIN index --help
 
 ## Guarded implementation workflow details
 
-The command catalog above is the authoritative quick reference. The following
-sections explain what happens after invoking `work`. Do not run two executors
-against the same repository at the same time.
+Do not run two executors against the same repository at the same time. Generate
+a structured plan with explicit allowed paths, review it, create an approval,
+and execute it in a new process. Codex uses `workspace-write` only for the
+approved execution process; Claude uses `acceptEdits` only at that stage.
 
-### Claude Code CLI (requires ANTHROPIC_API_KEY)
+Approval is invalidated if the commit, initial working tree, or effective policy
+changes. The approval is single-use and is consumed before executor launch.
+After execution, the CLI rejects commits and reports Git-visible paths outside
+the allowlist. It does not automatically roll changes back.
 
-From the target repository:
+Copilot can still consume the planning prompt, but its editor session cannot be
+enclosed by the CLI's execution and post-validation boundary. Use Codex or
+Claude when the enforced lifecycle is required.
 
-```sh
-cd /path/to/your/repo
-uv run orchestrate work "describe the coding change and what done means" --executor claude
-```
-
-Claude Code launches as a subprocess in the repo directory, reads the effective
-`AGENTS.md`, calls `plan_task`, shows the plan, and stops without editing.
-After reviewing it, reply:
-
-> Approved. Implement the plan. Preserve existing unrelated changes.
-
-Claude Code calls `ask_orchestrator` with the same `repo_root`, implements the
-approved scope, runs permitted checks, and reports the handoff. File edits are
-auto-accepted; shell commands require your approval (`--permission-mode acceptEdits`).
-
-Requires `ANTHROPIC_API_KEY` in your environment. Add to `~/.zshrc`:
-```sh
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-### VS Code Copilot Agent mode
-
-From the target repository:
-
-```sh
-cd /path/to/your/repo
-uv run orchestrate work "describe the coding change and what done means" --executor copilot
-```
-
-The command prints the guarded prompt — copy it and paste into VS Code Copilot agent mode.
-Copilot calls `#plan_task`, shows the plan, and stops without editing. After reviewing it, reply:
-
-> Approved. Implement the plan. Preserve existing unrelated changes.
-
-Copilot calls `#ask_orchestrator` with the same `repo_root`, implements the approved scope,
-runs checks permitted by `AGENTS.md`, and reports the handoff.
-
-### Codex CLI (requires Codex CLI on PATH)
-
-Change to the repository you want edited:
-
-```sh
-cd /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
-/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/orchestrate work \
-  "describe the coding change and what done means"
-```
-
-The launcher uses the current Git root as `repo_root`, starts Codex with
-`workspace-write` sandboxing and on-request approvals, and instructs Codex to:
-
-1. Read the effective `AGENTS.md`.
-2. Call `plan_task` with the task and repository.
-3. Show the plan and stop without editing.
-4. Wait for a separate approval message.
-
-After reviewing the plan, reply in the same Codex session:
-
-> Approved. Implement the plan. Preserve existing unrelated changes.
-
-Codex will call `ask_orchestrator` with the same `repo_root`, implement the
-approved scope, run permitted checks, and report the final diff, checks run,
-checks not run, failures, assumptions, and risks. It will not commit, push,
-deploy, access secrets, or perform human-gated operations without separate
-explicit authorization.
-
-To target a repository without changing directories:
-
-```sh
-cd /Users/jelambeadmin/Documents/orchestrator_code
-uv run orchestrate work \
-  "describe the coding change and what done means" \
-  --repo-root /Users/jelambeadmin/Documents/access-sysops/Operations_ServiceIndex_Infrastructure
-```
-
-To preview the guarded prompt without launching Codex:
-
-```sh
-uv run orchestrate work "your task" --repo-root /repo --print-only
-```
+See [`PLAN_APPROVAL_WORKFLOW.md`](PLAN_APPROVAL_WORKFLOW.md) for the complete
+workflow and its current limitations.
 
 ---
 
 ## Phase 4 — MCP server (Codex and VS Code integration)
 
-The MCP server exposes four tools that Codex, VS Code Copilot, and other MCP clients can call:
+The MCP server exposes six tools that Codex, VS Code Copilot, and other MCP
+clients can call:
+
 - `ask_orchestrator` — routes a prompt through the full pipeline and returns the answer; pass `use_judge=false` for a faster single-pass response
 - `plan_task` — generates a scoped plan (scope, changes, checks, human gates, risks) without executing anything
+- `plan_task_structured` — returns a versioned plan record without writing it
+- `validate_plan_approval` — checks supplied records against current repository and policy state
 - `audit_index` — reports what is safe to index without making model calls
 - `index_codebase` — safety-scans and indexes a directory into the RAG vector store
 
 The server is advisory. It does not edit files or run commands. Codex or another
 coding agent must apply the response and perform validation.
 
-**Recommended agent workflow:**
-1. Start Codex in the target Git repository so its local `AGENTS.md` is active.
-2. Call `plan_task` with that repository as `repo_root` → review the output.
-3. If approved, call `ask_orchestrator` with the same `repo_root`.
-4. Have the calling agent edit the files and run only checks permitted by the
-   effective `AGENTS.md`; human-only checks remain explicitly pending.
+**Recommended enforced workflow:** use the CLI `plan --allow`, `approve`, and
+`execute` lifecycle documented above. It binds approval to structured records
+and current repository and policy state.
+
+**Compatibility advisory workflow:** an MCP client may call `plan_task`, stop for
+human review, and later call `ask_orchestrator` with the same task, `repo_root`,
+and `effective_constraints`. That sequence remains advisory: MCP does not create
+or consume the canonical approval record and does not launch the executor.
 
 **Optional diagnostic start:**
 ```sh
@@ -403,30 +386,34 @@ in `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.orchestrator]
-command = "/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/python"
-args = ["/Users/jelambeadmin/Documents/orchestrator_code/mcp_server.py"]
-cwd = "/Users/jelambeadmin/Documents/orchestrator_code"
+command = "/path/to/orchestrator_code/.venv/bin/python"
+args = ["/path/to/orchestrator_code/mcp_server.py"]
+cwd = "/path/to/orchestrator_code"
 enabled = true
 required = false
 startup_timeout_sec = 30
 tool_timeout_sec = 300
-enabled_tools = ["plan_task", "ask_orchestrator", "audit_index"]
+enabled_tools = [
+  "plan_task",
+  "plan_task_structured",
+  "validate_plan_approval",
+  "ask_orchestrator",
+  "audit_index",
+]
 ```
 
 Restart Codex, then verify with `codex mcp list` or `/mcp`. Run Codex in the
 repository that it should edit:
 
 ```sh
-codex -C /Users/jelambeadmin/Documents/access-sysops/Operations_PortalCMS_Django
+codex -C /path/to/target-repository
 ```
 
-Example prompt:
+Example compatibility planning prompt:
 
-> Call the orchestrator's plan_task tool first and show me the plan. After I
-> approve it, call ask_orchestrator with this repository as repo_root, inspect
-> its advice, make the changes in the workspace, and run only checks permitted
-> by the effective AGENTS.md. Report prohibited checks as pending. Do not push
-> or deploy.
+> Call the orchestrator's plan_task tool with this repository as repo_root and
+> show me the plan. Then stop without editing. I will use the separate structured
+> plan, approval, and execute CLI workflow if implementation should follow.
 
 ### Register with VS Code Copilot
 
@@ -440,16 +427,17 @@ Contents:
   "servers": {
     "orchestrator": {
       "type": "stdio",
-      "command": "/Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/python",
-      "args": ["/Users/jelambeadmin/Documents/orchestrator_code/mcp_server.py"],
-      "cwd": "/Users/jelambeadmin/Documents/orchestrator_code"
+      "command": "/path/to/orchestrator_code/.venv/bin/python",
+      "args": ["/path/to/orchestrator_code/mcp_server.py"],
+      "cwd": "/path/to/orchestrator_code"
     }
   }
 }
 ```
 
 **Verify:**
-- In VS Code Copilot agent mode, type `#plan_task` or `#ask_orchestrator` — both should appear as available tools
+- In VS Code Copilot agent mode, type `#plan_task`, `#plan_task_structured`, or
+  `#ask_orchestrator`; the tools should appear as available.
 - Try: *"Use plan_task to propose how to refactor the contacts_updater.py file"*
 
 ### Register with Claude Code CLI
@@ -464,8 +452,8 @@ user-scoped settings (available from any directory):
 
 ```sh
 claude mcp add --scope user orchestrator \
-  /Users/jelambeadmin/Documents/orchestrator_code/.venv/bin/python \
-  /Users/jelambeadmin/Documents/orchestrator_code/mcp_server.py
+  /path/to/orchestrator_code/.venv/bin/python \
+  /path/to/orchestrator_code/mcp_server.py
 ```
 
 Note: `claude mcp list` only shows servers in scope for the current directory.

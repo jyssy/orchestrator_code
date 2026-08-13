@@ -8,12 +8,17 @@ Register in VS Code settings.json (see SETUP.md Phase 4).
 
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
 from fastmcp import FastMCP
-from orchestrator.pipeline import run, plan
+
+from orchestrator.approval import validate_approval
+from orchestrator.context import capture_repository_snapshot, reload_policy_identity
+from orchestrator.models import ApprovalRecord, StructuredPlan
+from orchestrator.pipeline import plan, plan_structured, run
 from orchestrator.rag import index_directory, scan_directory
 
 _INSTRUCTIONS = """This server is advisory: its tools generate plans and answers but
@@ -22,7 +27,9 @@ first with the target repo_root and present the result for approval. After appro
 call ask_orchestrator with the same repo_root. Effective AGENTS.md guidance is
 authoritative. The MCP client may edit files and run only checks that guidance permits;
 it must report prohibited checks as pending human actions. Call index_codebase only
-when the user explicitly asks to refresh the RAG index."""
+when the user explicitly asks to refresh the RAG index. For an enforceable lifecycle,
+use plan_task_structured and validate_plan_approval with an external human approval
+record; the CLI owns approval creation and write-capable executor launch."""
 
 mcp = FastMCP("orchestrator", instructions=_INSTRUCTIONS)
 
@@ -37,6 +44,7 @@ def ask_orchestrator(
     context_paths: list[str] | None = None,
     repo_root: str = "",
     use_judge: bool = True,
+    effective_constraints: str = "",
 ) -> str:
     """
     Route a prompt through the full REALMS + local model pipeline.
@@ -51,6 +59,7 @@ def ask_orchestrator(
         context_paths=context_paths,
         repo_root=repo_root or None,
         judge_enabled=use_judge,
+        effective_constraints=effective_constraints,
     )
     return result["final"]
 
@@ -64,6 +73,7 @@ def plan_task(
     context_path: str = "",
     context_paths: list[str] | None = None,
     repo_root: str = "",
+    effective_constraints: str = "",
 ) -> str:
     """
     Generate a structured plan for a task without executing it.
@@ -76,7 +86,54 @@ def plan_task(
         context_path=context_path or None,
         context_paths=context_paths,
         repo_root=repo_root or None,
+        effective_constraints=effective_constraints,
     )
+
+
+@mcp.tool(
+    timeout=300,
+    annotations={"readOnlyHint": True, "openWorldHint": True},
+)
+def plan_task_structured(
+    prompt: str,
+    repo_root: str,
+    allowed_paths: list[str],
+    effective_constraints: str = "",
+    context_path: str = "",
+    context_paths: list[str] | None = None,
+) -> str:
+    """Return a versioned plan record without writing it or editing the repository."""
+    structured = plan_structured(
+        prompt,
+        repo_root=repo_root,
+        allowed_paths=allowed_paths,
+        effective_constraints=effective_constraints,
+        context_path=context_path or None,
+        context_paths=context_paths,
+    )
+    return structured.to_json()
+
+
+@mcp.tool(
+    timeout=120,
+    annotations={"readOnlyHint": True, "openWorldHint": False},
+)
+def validate_plan_approval(plan_json: str, approval_json: str) -> str:
+    """Validate an externally recorded human approval against current state."""
+    structured = StructuredPlan.from_json(plan_json)
+    approval = ApprovalRecord.from_json(approval_json)
+    snapshot = capture_repository_snapshot(Path(structured.repository.repo_root))
+    policy = reload_policy_identity(
+        structured.policy.sources, structured.effective_constraints
+    )
+    validate_approval(
+        structured,
+        approval,
+        current_base_commit=snapshot.base_commit,
+        current_working_tree_fingerprint=snapshot.working_tree_fingerprint,
+        current_policy_fingerprint=policy.fingerprint,
+    )
+    return f"Approval is valid for plan {structured.plan_id}."
 
 
 @mcp.tool(

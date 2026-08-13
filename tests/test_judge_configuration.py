@@ -60,6 +60,7 @@ def test_no_judge_cli_option_disables_judge_for_that_request(monkeypatch):
         judge_enabled=None,
         context_paths=None,
         repo_root=None,
+        effective_constraints=None,
     ):
         received["judge_enabled"] = judge_enabled
         return {
@@ -86,11 +87,13 @@ def test_mcp_ask_forwards_judge_choice(monkeypatch):
         judge_enabled=None,
         context_paths=None,
         repo_root=None,
+        effective_constraints=None,
     ):
         received["context_path"] = context_path
         received["context_paths"] = context_paths
         received["repo_root"] = repo_root
         received["judge_enabled"] = judge_enabled
+        received["effective_constraints"] = effective_constraints
         return {"final": "answer"}
 
     monkeypatch.setattr(mcp_server, "run", fake_run)
@@ -107,4 +110,36 @@ def test_mcp_ask_forwards_judge_choice(monkeypatch):
         "context_paths": None,
         "repo_root": None,
         "judge_enabled": False,
+        "effective_constraints": "",
+    }
+
+
+def test_mcp_structured_plan_forwards_constraints_and_allowed_paths(monkeypatch):
+    received = {}
+
+    class FakePlan:
+        def to_json(self):
+            return '{"schema_version": 1}'
+
+    def fake_plan_structured(prompt, **kwargs):
+        received.update(prompt=prompt, **kwargs)
+        return FakePlan()
+
+    monkeypatch.setattr(mcp_server, "plan_structured", fake_plan_structured)
+
+    result = mcp_server.plan_task_structured(
+        "prompt",
+        repo_root="/repo",
+        allowed_paths=["src/**"],
+        effective_constraints="Do not commit.",
+    )
+
+    assert result == '{"schema_version": 1}'
+    assert received == {
+        "prompt": "prompt",
+        "repo_root": "/repo",
+        "allowed_paths": ["src/**"],
+        "effective_constraints": "Do not commit.",
+        "context_path": None,
+        "context_paths": None,
     }
