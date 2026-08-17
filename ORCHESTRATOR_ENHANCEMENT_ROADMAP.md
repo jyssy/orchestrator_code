@@ -52,11 +52,70 @@ The practical target is a dependable internal orchestration tool with:
 This target does not require turning the project into a distributed workflow
 platform or an autonomous multi-agent system.
 
+## Status summary (audited August 2026)
+
+An implementation audit against the actual code (not just commit messages)
+found roughly **50–55% of this roadmap implemented**, concentrated almost
+entirely in Phase 1 and two items of Phase 2. Three commits map cleanly onto
+the phases below: `8b27729` (Phase 1), `30924a7` (Phase 2A), `36c7101`
+(Phase 2B / item 6). All 64 tests in `tests/` pass. Each item below now
+carries a **Current status** line; this table is the fast summary:
+
+| Phase / item | Status | Estimate |
+|---|---|---|
+| Phase 1, items 1–3 (boundary, structured plans, policy propagation) | Done | ~100% |
+| Phase 1, item 4 (workspace roots + remote-indexing consent) | Partial | ~50% |
+| Phase 2A (model-egress + secret scanning) | Done | 100% |
+| Phase 2, item 5 (transactional RAG) | Not started | ~0% |
+| Phase 2, item 6 / Phase 2B (structured results) | Done | 100% |
+| Phase 2, item 7 (capability-based model registry, offline mode) | Not started | ~10% |
+| Phase 2, item 8 (content-security controls) | Partial | ~75% |
+| Phase 2, item 9 (boundary-focused testing) | Partial | ~70% |
+| Phase 3, items 10–11 (observability, shared-service controls) | Not started | 0% (deliberately deferred) |
+
+**Highest-impact items still outstanding, in priority order:**
+
+1. **Item 5 — transactional RAG indexing.** `orchestrator/rag.py` still
+   deletes the live Chroma collection before new embeddings are confirmed
+   (`rebuild=True` path), so an interrupted or failing rebuild can leave the
+   index empty or partial — the exact failure mode this item exists to fix.
+2. **Item 7 — capability-based model registry / coherent offline mode.** No
+   `orchestrator/model_registry.py` exists. Only the coding specialist has a
+   local fallback; ops, search, reasoning, judge, embedding, and reranking
+   have none, and `OFFLINE_MODE=true` raises a terminal, non-retryable error
+   instead of routing to a local provider.
+3. **Item 4 — workspace-root allowlist.** No configured boundary restricts
+   which directories may be used as `repo_root`/context paths in the CLI or
+   MCP. `RAG_SOURCE_DIRS` only widens where `AGENTS.md` is discovered; it is
+   not an access-control mechanism.
+4. **Item 4 acceptance criterion — index-directory permissions.** Unlike plan
+   and approval records (explicitly `chmod(0o700)`/`chmod(0o600)` in
+   `orchestrator/approval.py`), the persisted Chroma index directory in
+   `orchestrator/rag.py` is created with default permissions.
+5. **Item 8 — typed separation of policy vs. untrusted content.** Context is
+   still one flattened string with a prepended notice, not distinct
+   message roles or typed fields; `how-orchestration-herein-works.md`
+   already concedes this does not technically isolate policy from
+   repository-controlled content.
+
+**One naming deviation, not a regression:** item 4's proposed `deny-index`
+classification shipped as `deny-model` in `orchestrator/security.py` — a
+deliberately broader scope (blocks model use generally, not only indexing)
+rather than a gap.
+
 ## Phase 1: Critical boundary hardening
 
 This phase offers the largest risk reduction and should be completed first.
 
 ### 1. Separate planning from write-capable execution
+
+**Current status — Done.** `cli.py` implements `plan`, `approve`, and
+`execute` as separate commands. Read-only planning sandboxing lives in
+`orchestrator/workflow.py`; approval creation, drift revalidation, and
+single-use consumption live in `orchestrator/approval.py`; post-execution
+scope validation is `orchestrator/workflow.py`'s `validate_execution_result`,
+wired into `cli.py`'s `execute` command. Covered by
+`tests/test_phase1_approval.py` (14 tests) and `tests/test_workflow.py`.
 
 **Problem**
 
@@ -90,6 +149,13 @@ behavioral convention rather than a technical boundary.
 - Out-of-scope changed paths are reported and block a successful handoff.
 
 ### 2. Introduce structured plans
+
+**Current status — Done.** `orchestrator/models.py`'s `StructuredPlan` is
+versioned (`SCHEMA_VERSION`), content-addressed (plan ID is a digest of its
+contents), and validated on load, rejecting malformed or wrong-version
+records. `orchestrator/pipeline.py`'s `plan_structured` builds it from real
+repository and policy state. Covered by `tests/test_phase1_approval.py`
+(roundtrip/tamper and schema-version-rejection tests).
 
 **Problem**
 
@@ -129,6 +195,14 @@ prose as the authoritative record. Validate model output before presenting it.
 
 ### 3. Propagate effective policy consistently
 
+**Current status — Done.** `orchestrator/context.py`'s
+`load_policy_identity`/`reload_policy_identity` compute one SHA-256
+fingerprint over guidance, model-egress policy, and constraints, used
+identically by `plan`, `approve`, `execute`, and MCP's
+`validate_plan_approval`. Precedence (`AGENTS.override.md` over `AGENTS.md`,
+broader over specific) is implemented and tested in `tests/test_context.py`;
+fingerprint composition is tested in `tests/test_phase1_approval.py`.
+
 **Problem**
 
 The architect and executor can reach different conclusions if they receive
@@ -158,6 +232,22 @@ different policy sources or precedence rules.
 - Missing policy context is visible rather than silently ignored.
 
 ### 4. Restrict accessible roots and remote indexing
+
+**Current status — Partial.** Remote-indexing opt-in via repository
+classification is done: `orchestrator/security.py` requires
+`DataClassification.REMOTE_APPROVED` from `.orchestrator-policy.toml`,
+enforced in `orchestrator/rag.py`. Read-only, no-model-call audit mode is
+done (`orchestrator/rag.py`'s `scan_directory`, used by `audit-index` and
+`audit_index`). Still missing: no configured **allowlist of workspace
+roots** exists anywhere — `RAG_SOURCE_DIRS` only widens where `AGENTS.md` is
+discovered, it does not gate which directories may be used as `repo_root` or
+context paths in the CLI or MCP; and no **restrictive permissions** are
+applied to the persisted Chroma index directory (`orchestrator/rag.py`'s
+`mkdir` call has no `mode=`), unlike plan/approval records which are
+explicitly `chmod(0o700)`/`chmod(0o600)` in `orchestrator/approval.py`. The
+classification names also shipped as `deny-model`/`local-only`/
+`remote-approved` rather than the proposed `deny-index` — a deliberately
+broader substitution, not a gap.
 
 **Problem**
 
@@ -207,6 +297,16 @@ coding agents; stronger isolation requires a sanitized worktree or OS/container
 filesystem boundary.
 
 ### 5. Make RAG updates transactional and repository-isolated
+
+**Current status — Not started.** No `orchestrator/index_store.py` exists.
+`orchestrator/rag.py`'s `index_directory` (`rebuild=True` path) still calls
+`client.delete_collection(...)` before any new embeddings are computed or
+uploaded — precisely the failure mode this item exists to fix. There is no
+staging collection, manifest (commit/scanner-version/digests), atomic
+activation, or retained previous-good version. Self-confirmed as future work
+in `how-orchestration-herein-works.md`, `SECURITY.md`, and
+`PLAN_APPROVAL_WORKFLOW.md`. This is the single highest-impact item still
+outstanding.
 
 **Problem**
 
@@ -288,6 +388,19 @@ part of Phase 2B's safe diagnostic contract.
 
 ### 7. Make offline and fallback behavior coherent
 
+**Current status — Not started (~10%).** No `orchestrator/model_registry.py`
+exists; `orchestrator/specialists.py` hardcodes one model per task-type
+category as module constants, with no independently configurable
+primary/fallback pairing per capability. Only the coding path has a local
+fallback (triggered by `RemoteTransmissionDenied` or
+`UNAVAILABLE_DEPENDENCY`) — ops, search, reasoning, judge, embedding, and
+reranking have none. `OFFLINE_MODE=true` raises a terminal,
+non-retryable `ProviderFailure(INVALID_CONFIGURATION, ...)` rather than
+deterministically routing to a local provider, so offline mode is not yet a
+coherent, documented capability contract. Self-confirmed in
+`how-orchestration-herein-works.md` under "Fallback coverage is
+intentionally narrow."
+
 **Problem**
 
 Fallback behavior differs by task type, and offline mode does not provide a
@@ -318,6 +431,20 @@ consistent capability contract.
 - Responses identify degraded operation without exposing sensitive details.
 
 ### 8. Continue strengthening content-security controls
+
+**Current status — Partial (~75%).** Done: filename/suffix/directory/content
+filters (`orchestrator/security.py`); mandatory Gitleaks scanning (Phase 2A,
+`orchestrator/secret_scanner.py`); accept/reject reasons recorded without
+content (`orchestrator/rag.py`'s `IndexReport.skipped` counter); local-only
+mode for sensitive repositories. Not started: optional entropy-based
+detection beyond Gitleaks' own ruleset and the small regex set in
+`security.py`. Partial: repository content is prepended with an
+untrusted-evidence notice (`orchestrator/pipeline.py`) but policy, caller
+intent, and repository content remain **one flattened string**, not
+separated into distinct message roles or typed fields —
+`how-orchestration-herein-works.md` already concedes "the ordering
+communicates priority to the model but does not technically isolate policy
+from untrusted repository content."
 
 **Problem**
 
@@ -351,6 +478,18 @@ confidential artifact, or prompt-injection attempt.
 
 ### 9. Expand boundary-focused testing
 
+**Current status — Partial (~70%).** 64 tests across `tests/*.py` currently
+pass (`uv run pytest -q`), with strong coverage of policy precedence,
+out-of-repo/sensitive explicit files, prompt-injection-adjacent secret
+content in tasks, retry exhaustion/timeouts, repo drift between plan and
+execute, approval reuse/expiry/mismatch, diffs exceeding approved paths,
+redaction guarantees, multi-repo/nested-policy isolation, and stale-RAG-chunk
+rejection. Gaps: no transactional-index activation/rollback tests (the
+feature itself doesn't exist yet — see item 5), no dedicated
+symlink-escape-race test for the approval/execution boundary, and no true
+offline-vs-degraded model-selection tests beyond the coding path (see item
+7).
+
 The test suite should cover behavior at trust and failure boundaries, including:
 
 - Policy precedence and caller-provided constraints.
@@ -378,6 +517,12 @@ critical service.
 
 ### 10. Add safe observability
 
+**Current status — Not started.** No structured event emission, request/
+plan/execution identifiers, stage timing, or usage counters exist anywhere
+in the codebase. `orchestrator/results.py`'s `ComponentResult`/`Diagnostic`
+(delivered under item 6) is a reusable foundation but is not yet wired to
+any event sink.
+
 Add structured events for:
 
 - Request, plan, approval, and execution identifiers.
@@ -392,6 +537,14 @@ Do not log credentials, full prompts, source content, embeddings, or unredacted
 provider responses by default.
 
 ### 11. Add shared-service controls when needed
+
+**Current status — Not started, and deliberately deferred.** No role-based
+approval, tamper-evident approval chaining beyond the existing
+digest/consumed-marker mechanism, quotas, concurrency limits, cancellation,
+health commands, or retention controls exist. This phase is explicitly
+gated behind "only if this becomes shared/business-critical" both here and
+in `PLAN_APPROVAL_WORKFLOW.md`'s limitations section, so its absence is by
+design, not an oversight.
 
 Potential additions include:
 
