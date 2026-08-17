@@ -38,7 +38,6 @@ from orchestrator.workflow import (
     build_claude_command,
     build_codex_command,
     build_codex_prompt,
-    build_copilot_prompt,
     build_execution_command,
     build_execution_prompt,
     guard_external_agent_prompt,
@@ -87,6 +86,12 @@ def work(
         help="Code executor to prepare",
         case_sensitive=False,
     ),
+    add_dir: list[str] = typer.Option(
+        None,
+        "--add-dir",
+        help="Additional directory Claude Code may read beyond the target repository; "
+        "repeat to add more. Ignored for Codex.",
+    ),
     print_only: bool = typer.Option(
         False,
         "--print-only",
@@ -96,29 +101,16 @@ def work(
     """Launch a compatibility agent in read-only planning mode."""
     try:
         target = resolve_target_repo(repo_root)
-        if executor is Executor.COPILOT:
-            prompt = build_copilot_prompt(task, target)
-        else:
-            prompt = build_codex_prompt(task, target)
+        prompt = build_codex_prompt(task, target)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
     console.print(f"[bold cyan]Repository:[/bold cyan] {target}")
     console.print(f"[bold cyan]Executor:[/bold cyan] {executor.value}")
 
-    if executor is Executor.COPILOT:
-        console.print(
-            Panel(
-                prompt,
-                title="Paste into VS Code Copilot Agent mode",
-                border_style="blue",
-            )
-        )
-        return
-
     try:
         if executor is Executor.CLAUDE:
-            command = build_claude_command(task, target)
+            command = build_claude_command(task, target, add_dirs=add_dir)
         else:
             command = build_codex_command(task, target)
     except ValueError as exc:
@@ -259,6 +251,12 @@ def execute_command(
         help="Write-capable executor to launch",
         case_sensitive=False,
     ),
+    add_dir: list[str] = typer.Option(
+        None,
+        "--add-dir",
+        help="Additional directory Claude Code may read beyond the target repository; "
+        "repeat to add more. Ignored for Codex.",
+    ),
     print_only: bool = typer.Option(
         False,
         "--print-only",
@@ -282,7 +280,7 @@ def execute_command(
             current_working_tree_fingerprint=before.working_tree_fingerprint,
             current_policy_fingerprint=policy.fingerprint,
         )
-        command = build_execution_command(structured, executor)
+        command = build_execution_command(structured, executor, add_dirs=add_dir)
     except (OSError, TypeError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 

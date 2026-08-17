@@ -150,10 +150,7 @@ expands an approval.
 
 `orchestrate work` now launches Codex or Claude in read-only planning mode.
 Planning sessions cannot be elevated in place. Use `plan --allow`, `approve`,
-and `execute` when implementation may follow. Copilot remains a prompt-only
-integration and cannot provide the CLI-enforced execution lifecycle. Although
-the shared executor enum causes CLI help to list Copilot, `execute` intentionally
-rejects it; use Codex or Claude for enforced execution.
+and `execute` when implementation may follow.
 
 ## Security boundary and limitations
 

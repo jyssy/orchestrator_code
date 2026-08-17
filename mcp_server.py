@@ -1,9 +1,9 @@
 """
 mcp_server.py — exposes the orchestrator pipeline as MCP tools
-so VS Code Copilot (and other MCP clients) can call it.
+so Codex, Claude Code, and other MCP clients can call it.
 
 Start with: uv run python mcp_server.py
-Register in VS Code settings.json (see SETUP.md Phase 4).
+Register with Codex or Claude Code (see SETUP.md Phase 4).
 """
 
 import os

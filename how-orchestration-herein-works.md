@@ -9,7 +9,7 @@ run a second model pass to critique and revise the answer.
 
 The orchestrator is **advisory**. It produces plans and technical advice, but it
 does not edit a target repository or run that repository's validation commands.
-A separate coding agent—such as Codex, VS Code Copilot, or Claude Code—acts as the
+A separate coding agent—such as Codex or Claude Code—acts as the
 executor after a human approves the plan.
 
 MCP in this repository means **Model Context Protocol**. MCP is the integration
@@ -42,7 +42,7 @@ Human
   |
   | task and approval
   v
-Coding agent (Codex, Copilot, or Claude Code)
+Coding agent (Codex or Claude Code)
   |
   | MCP tool call over stdio
   v
@@ -595,15 +595,13 @@ This is now a compatibility read-only planning entry point. It resolves the
 target Git root, validates task text, and then:
 
 - Launches Codex by default.
-- Launches Claude Code when selected.
-- Prints a prompt to paste into Copilot when selected.
+- Launches Claude Code with `--executor claude`.
 - Prints the launch details without starting an agent with `--print-only`.
 
 The launched agent receives instructions to inspect the repository, call
 `plan_task`, show the proposal, and stop. It cannot be elevated in place.
 
-Codex uses a read-only sandbox and Claude Code uses plan permission mode. Copilot
-receives the planning workflow as text for the user to paste into Agent mode.
+Codex uses a read-only sandbox and Claude Code uses plan permission mode.
 
 ### `orchestrate audit-index`
 
@@ -648,7 +646,7 @@ each decision.
 
 ```text
 Integration plane
-  cli.py | FastMCP | Codex/Copilot/Claude launchers
+  cli.py | FastMCP | Codex/Claude launchers
        |
        v
 Orchestration plane

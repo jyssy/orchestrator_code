@@ -5,9 +5,9 @@ import pytest
 from orchestrator.models import PolicyIdentity, RepositorySnapshot, StructuredPlan
 from orchestrator.workflow import (
     Executor,
+    build_claude_command,
     build_codex_command,
     build_codex_prompt,
-    build_copilot_prompt,
     build_execution_command,
     build_execution_prompt,
     resolve_target_repo,
@@ -34,15 +34,13 @@ def test_workflow_prompts_lock_repo_approval_and_handoff(tmp_path):
     task = "Add request validation"
 
     codex_prompt = build_codex_prompt(task, repo)
-    copilot_prompt = build_copilot_prompt(task, repo)
 
-    for prompt in (codex_prompt, copilot_prompt):
-        assert task in prompt
-        assert str(repo) in prompt
-        assert "plan_task" in prompt
-        assert "STOP" in prompt
-        assert "separate" in prompt
-        assert "Do not commit" in prompt
+    assert task in codex_prompt
+    assert str(repo) in codex_prompt
+    assert "plan_task" in codex_prompt
+    assert "STOP" in codex_prompt
+    assert "separate" in codex_prompt
+    assert "Do not commit" in codex_prompt
 
 
 def test_codex_planning_command_uses_read_only_sandbox(tmp_path, monkeypatch):
@@ -64,6 +62,38 @@ def test_codex_planning_command_uses_read_only_sandbox(tmp_path, monkeypatch):
         "on-request",
     ]
     assert "Fix the parser" in command[-1]
+
+
+def test_claude_planning_command_forwards_add_dir(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    monkeypatch.setattr(
+        "orchestrator.workflow.shutil.which",
+        lambda executable: "/usr/local/bin/claude",
+    )
+
+    command = build_claude_command(
+        "Fix the parser", repo, add_dirs=["/extra/one", "/extra/two"]
+    )
+
+    assert "--add-dir" in command
+    add_dir_index = command.index("--add-dir")
+    assert command[add_dir_index + 1 : add_dir_index + 3] == [
+        "/extra/one",
+        "/extra/two",
+    ]
+    assert command[-2] == "--"
+
+
+def test_claude_planning_command_omits_add_dir_when_unset(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    monkeypatch.setattr(
+        "orchestrator.workflow.shutil.which",
+        lambda executable: "/usr/local/bin/claude",
+    )
+
+    command = build_claude_command("Fix the parser", repo)
+
+    assert "--add-dir" not in command
 
 
 def test_workflow_rejects_high_confidence_secret_material(tmp_path):

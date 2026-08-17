@@ -93,7 +93,7 @@ metadata.
 
 This control covers content transmitted through the Python orchestrator and the
 initial CLI-generated Codex or Claude prompt. It cannot intercept independent
-file reads or provider calls made later by Codex, Claude Code, VS Code Copilot,
+file reads or provider calls made later by Codex, Claude Code,
 Continue, editor extensions, shell tools, or other software. A `.gitignore`,
 `.claudeignore`, prompt instruction, or secret scanner is not an operating-system
 read barrier.

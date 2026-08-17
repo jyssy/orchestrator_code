@@ -15,7 +15,6 @@ from orchestrator.security import load_data_classification, sensitive_content_re
 
 class Executor(str, Enum):
     CODEX = "codex"
-    COPILOT = "copilot"
     CLAUDE = "claude"
 
 
@@ -74,23 +73,6 @@ playbooks, perform migrations, or restart services unless I separately and
 explicitly authorize the exact action."""
 
 
-def build_copilot_prompt(task: str, repo_root: Path) -> str:
-    """Build the equivalent VS Code Copilot Agent-mode prompt."""
-    task = _validate_task(task)
-    return f"""Work only in this repository: {repo_root}
-
-Task: {task}
-
-Use `#plan_task` with repo_root="{repo_root}" and show me the plan without
-editing. Then STOP. Approval and execution must occur as separate workflow steps.
-
-Preserve unrelated work. In the handoff, report files changed, checks passed,
-checks not run, failures, assumptions, and unresolved risks. Do not commit,
-push, merge, tag, release, deploy, access secrets, run infrastructure plans or
-playbooks, perform migrations, or restart services without separate explicit
-authorization."""
-
-
 def build_codex_command(task: str, repo_root: Path) -> list[str]:
     """Return a shell-free, read-only Codex planning command."""
     executable = shutil.which("codex")
@@ -109,7 +91,9 @@ def build_codex_command(task: str, repo_root: Path) -> list[str]:
     ]
 
 
-def build_claude_command(task: str, repo_root: Path) -> list[str]:
+def build_claude_command(
+    task: str, repo_root: Path, *, add_dirs: list[str] | None = None
+) -> list[str]:
     """Return a shell-free Claude Code command in read-only plan mode."""
     executable = shutil.which("claude")
     if executable is None:
@@ -123,6 +107,7 @@ def build_claude_command(task: str, repo_root: Path) -> list[str]:
         executable,
         "--permission-mode", "plan",
         "--mcp-config", str(mcp_config),
+        *(["--add-dir", *add_dirs] if add_dirs else []),
         "--",  # stops --mcp-config from greedily consuming the prompt as a second config path
         build_codex_prompt(task, repo_root),
     ]
@@ -154,7 +139,9 @@ handoff and final diff. If the tool is unavailable or scope cannot be honored,
 stop without editing."""
 
 
-def build_execution_command(plan: StructuredPlan, executor: Executor) -> list[str]:
+def build_execution_command(
+    plan: StructuredPlan, executor: Executor, *, add_dirs: list[str] | None = None
+) -> list[str]:
     """Return the write-capable command used only after approval validation."""
     prompt = build_execution_prompt(plan)
     repo_root = Path(plan.repository.repo_root)
@@ -183,12 +170,11 @@ def build_execution_command(plan: StructuredPlan, executor: Executor) -> list[st
             "acceptEdits",
             "--mcp-config",
             str(mcp_config),
+            *(["--add-dir", *add_dirs] if add_dirs else []),
             "--",
             prompt,
         ]
-    raise ValueError(
-        "Copilot execution cannot be enforced from this CLI; use Codex or Claude"
-    )
+    raise ValueError(f"Unsupported executor: {executor.value}")
 
 
 def guard_external_agent_prompt(prompt: str, repo_root: Path) -> None:

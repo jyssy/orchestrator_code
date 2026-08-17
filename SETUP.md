@@ -134,13 +134,14 @@ state are loaded deterministically before RAG context.
 
 ## Quick Start — guarded coding workflow
 
-Three executors are available:
+Two executors are available. Codex is the default for both `work` and
+`execute`; call out `--executor claude` explicitly any time Claude Code should
+run instead:
 
 | Executor | Command | How it runs |
 |---|---|---|
 | **Codex** (default) | `orchestrate work "task"` | Read-only planning subprocess |
 | **Claude Code** | `orchestrate work "task" --executor claude` | Read-only planning subprocess |
-| **VS Code Copilot** | `orchestrate work "task" --executor copilot` | Planning prompt only; not supported by enforced `execute` |
 
 `work` is now the compatibility planning launcher. For an implementation, use
 the enforced three-step workflow:
@@ -155,8 +156,21 @@ orchestrate approve "$PLAN_FILE"
 # Copy the exact Approval record path printed by approve.
 APPROVAL_FILE=/exact/path/printed/by/approve
 orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --print-only
+
+# Codex is the default executor; omit --executor to get it.
 orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --executor codex
+
+# Pass --executor claude explicitly to run Claude Code instead of Codex.
+orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --executor claude
 ```
+
+Both `work` and `execute` accept `--executor claude` (short form `-e claude`)
+to select Claude Code for that one invocation. The default stays Codex unless
+you pass this flag — there is no environment variable or config file override,
+so specify it on every command where Claude should run. Add
+`--add-dir /path/to/other/directory` (repeatable) on either command to let
+that Claude Code session read files outside the target repository, e.g. a
+shared library that lives in a sibling directory; it has no effect for Codex.
 
 See [`PLAN_APPROVAL_WORKFLOW.md`](PLAN_APPROVAL_WORKFLOW.md) for record formats,
 drift checks, constraints, scope validation, and limitations.
@@ -276,11 +290,18 @@ APPROVAL_FILE=/exact/path/printed/by/approve
 $ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" --print-only
 
 # Remove --print-only only after reviewing the validated command.
+# Codex is the default; this is equivalent to omitting --executor.
 $ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" --executor codex
+
+# To run Claude Code instead of Codex, pass --executor claude explicitly.
+$ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" --executor claude
+
+# Let that Claude Code session also read a directory outside the target repo:
+$ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" \
+  --executor claude \
+  --add-dir /path/to/shared-library
 ```
 
-Use `--executor claude` for Claude Code. Enforced execution does not support
-Copilot, even though the shared executor option currently appears in CLI help.
 If drift is reported, generate and approve a new plan. If execution fails or is
 interrupted, the approval stays consumed; inspect the repository before starting
 a newly planned and approved attempt. Scope failures are not rolled back.
@@ -300,19 +321,20 @@ Changing repository classification after planning invalidates approval.
 ```sh
 cd /path/to/target-repository
 
-# Claude Code — read-only planning subprocess
+# Codex — read-only planning subprocess (default; requires Codex CLI installed)
+$ORCHESTRATE_BIN work \
+  "describe the coding change and what done means"
+
+# Claude Code — pass --executor claude explicitly to select it over the Codex default
 $ORCHESTRATE_BIN work \
   "describe the coding change and what done means" \
   --executor claude
 
-# VS Code Copilot — prints prompt to paste into VS Code agent mode
+# Claude Code, also permitted to read a directory outside the target repository
 $ORCHESTRATE_BIN work \
   "describe the coding change and what done means" \
-  --executor copilot
-
-# Codex — read-only planning subprocess (default; requires Codex CLI installed)
-$ORCHESTRATE_BIN work \
-  "describe the coding change and what done means"
+  --executor claude \
+  --add-dir /path/to/shared-library
 
 # Preview the planning prompt without launching the planning agent
 $ORCHESTRATE_BIN work \
@@ -367,18 +389,14 @@ changes. The approval is single-use and is consumed before executor launch.
 After execution, the CLI rejects commits and reports Git-visible paths outside
 the allowlist. It does not automatically roll changes back.
 
-Copilot can still consume the planning prompt, but its editor session cannot be
-enclosed by the CLI's execution and post-validation boundary. Use Codex or
-Claude when the enforced lifecycle is required.
-
 See [`PLAN_APPROVAL_WORKFLOW.md`](PLAN_APPROVAL_WORKFLOW.md) for the complete
 workflow and its current limitations.
 
 ---
 
-## Phase 4 — MCP server (Codex and VS Code integration)
+## Phase 4 — MCP server (Codex and Claude Code integration)
 
-The MCP server exposes seven tools that Codex, VS Code Copilot, and other MCP
+The MCP server exposes seven tools that Codex, Claude Code, and other MCP
 clients can call:
 
 - `ask_orchestrator` — routes a prompt through the full pipeline and returns the answer; pass `use_judge=false` for a faster single-pass response
@@ -463,31 +481,6 @@ Example compatibility planning prompt:
 > show me the plan. Then stop without editing. I will use the separate structured
 > plan, approval, and execute CLI workflow if implementation should follow.
 
-### Register with VS Code Copilot
-
-The config lives at:
-```
-~/Library/Application Support/Code/User/mcp.json
-```
-Contents:
-```json
-{
-  "servers": {
-    "orchestrator": {
-      "type": "stdio",
-      "command": "/path/to/orchestrator_code/.venv/bin/python",
-      "args": ["/path/to/orchestrator_code/mcp_server.py"],
-      "cwd": "/path/to/orchestrator_code"
-    }
-  }
-}
-```
-
-**Verify:**
-- In VS Code Copilot agent mode, type `#plan_task`, `#plan_task_structured`, or
-  `#ask_orchestrator`; the tools should appear as available.
-- Try: *"Use plan_task to propose how to refactor the contacts_updater.py file"*
-
 ### Register with Claude Code CLI
 
 Claude Code CLI reads MCP config from a JSON file passed via `--mcp-config`.
@@ -507,6 +500,19 @@ claude mcp add --scope user orchestrator \
 Note: `claude mcp list` only shows servers in scope for the current directory.
 Run it from within a repo where the server is registered to confirm it appears.
 
+**Directory-read permissions.** A Claude Code executor subprocess (from
+`work --executor claude` or `execute --executor claude`) is launched with
+`cwd` set to the target repository, so its file tools default to that tree.
+Two independent knobs extend this:
+
+- Per-launch: pass `--add-dir /path/to/other/directory` (repeatable) to
+  `work` or `execute`; it forwards to Claude Code's native `--add-dir` flag
+  for that one subprocess only.
+- Per-session (interactive `claude`, not the orchestrator subprocess): set
+  `permissions.additionalDirectories` in `.claude/settings.json` (project) or
+  `~/.claude/settings.json` (global), e.g. `["~/Documents"]` to cover every
+  repo under a workspace root without per-project reconfiguration.
+
 **Additional secret protection:** Create a `.claudeignore` at the root of any repo with
 sensitive material to block Claude Code's file tools from reading those paths:
 ```
@@ -518,11 +524,11 @@ ansible/vault*
 *.tfstate.backup
 ```
 
-This ignore file is defense in depth, not enforcement. The orchestrator guards
-its own model calls and the initial CLI-generated agent prompt, but it cannot
-intercept later file reads made independently by Claude, Codex, Copilot,
-Continue, or editor extensions. Use a sanitized worktree or OS/container file
-boundary when those tools must be unable to access secret-bearing files.
+This is defense in depth, not enforcement — the orchestrator guards its own
+model calls and the initial CLI-generated agent prompt, but not later file
+reads by Claude, Codex, Continue, or other editor extensions. Use a sanitized
+worktree or OS/container file boundary where those tools must be unable to
+access secret-bearing files.
 
 ---
 
