@@ -5,6 +5,7 @@ Usage: uv run python cli.py "your prompt here"
 
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -19,8 +20,10 @@ load_dotenv(Path(__file__).parent / ".env", override=False)  # shell env vars ta
 from orchestrator.approval import (
     consume_approval,
     create_approval,
+    find_latest_plan,
     load_approval,
     load_plan,
+    resolve_latest_execution_records,
     save_approval,
     save_plan,
     validate_approval,
@@ -30,7 +33,14 @@ from orchestrator.approval import (
 from orchestrator.context import (
     capture_path_metadata,
     capture_repository_snapshot,
+    discover_repo_roots,
     reload_policy_identity,
+)
+from orchestrator.security import (
+    DataClassification,
+    MODEL_EGRESS_POLICY_FILENAME,
+    ModelEgressPolicyError,
+    load_model_egress_policy,
 )
 from orchestrator.workflow import (
     DEFAULT_EFFECTIVE_CONSTRAINTS,
@@ -208,7 +218,20 @@ def plan_command(
 
 @app.command("approve")
 def approve_command(
-    plan_file: Path = typer.Argument(..., help="Structured plan JSON to approve"),
+    plan_file: Path = typer.Argument(
+        None, help="Structured plan JSON to approve; omit and pass --latest instead"
+    ),
+    latest: bool = typer.Option(
+        False,
+        "--latest",
+        help="Approve the most recent plan record for --repo-root (or the current directory)",
+    ),
+    repo_root: Path = typer.Option(
+        None,
+        "--repo-root",
+        "-r",
+        help="Repository whose latest plan to approve; only used with --latest",
+    ),
     approved_by: str = typer.Option(
         None,
         "--approved-by",
@@ -217,6 +240,18 @@ def approve_command(
 ):
     """Create an explicit, single-use approval for an exact plan."""
     import getpass
+
+    if latest:
+        if plan_file is not None:
+            raise typer.BadParameter("Pass either a plan file or --latest, not both")
+        try:
+            lookup_target = resolve_target_repo(repo_root)
+            plan_file = find_latest_plan(lookup_target)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        console.print(f"[dim]Using latest plan for {lookup_target}: {plan_file}[/dim]")
+    elif plan_file is None:
+        raise typer.BadParameter("Provide a plan file path, or pass --latest")
 
     try:
         structured = load_plan(plan_file)
@@ -242,8 +277,23 @@ def approve_command(
 
 @app.command("execute")
 def execute_command(
-    plan_file: Path = typer.Argument(..., help="Approved structured plan JSON"),
-    approval_file: Path = typer.Argument(..., help="Matching approval JSON"),
+    plan_file: Path = typer.Argument(
+        None, help="Approved structured plan JSON; omit and pass --latest instead"
+    ),
+    approval_file: Path = typer.Argument(
+        None, help="Matching approval JSON; omit and pass --latest instead"
+    ),
+    latest: bool = typer.Option(
+        False,
+        "--latest",
+        help="Execute the most recent unconsumed approval for --repo-root (or the current directory)",
+    ),
+    repo_root: Path = typer.Option(
+        None,
+        "--repo-root",
+        "-r",
+        help="Repository whose latest approval to execute; only used with --latest",
+    ),
     executor: Executor = typer.Option(
         Executor.CODEX,
         "--executor",
@@ -264,6 +314,20 @@ def execute_command(
     ),
 ):
     """Validate approval and drift, then launch a separate execution session."""
+    if latest:
+        if plan_file is not None or approval_file is not None:
+            raise typer.BadParameter(
+                "Pass either explicit plan/approval files or --latest, not both"
+            )
+        try:
+            lookup_target = resolve_target_repo(repo_root)
+            plan_file, approval_file = resolve_latest_execution_records(lookup_target)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        console.print(f"[dim]Using latest approval for {lookup_target}: {approval_file}[/dim]")
+    elif plan_file is None or approval_file is None:
+        raise typer.BadParameter("Provide both plan and approval file paths, or pass --latest")
+
     try:
         structured = load_plan(plan_file)
         approval = load_approval(approval_file)
@@ -419,22 +483,30 @@ def index(
     rebuild: bool = typer.Option(
         True,
         "--rebuild/--resume",
-        help="Rebuild safely, or resume an interrupted scan whose source is unchanged",
+        help="Rebuild safely, or resume an interrupted scan whose source is unchanged. "
+        "Ignored when --refresh is passed.",
+    ),
+    refresh: bool = typer.Option(
+        False,
+        "--refresh",
+        help="Delete and re-embed only the repositories found under source, leaving "
+        "every other previously indexed repository untouched. Cheaper than --rebuild "
+        "across a large workspace, but still re-embeds every file in these "
+        "repositories regardless of whether it changed. Overrides --rebuild/--resume.",
     ),
 ):
     """Safety-scan and index a directory into the local ChromaDB vector store."""
-    from orchestrator.rag import index_directory
+    from orchestrator.rag import index_directory, refresh_repositories
 
     console.print(f"[dim]Scanning {source} before transmission...[/dim]")
 
     def show_progress(done: int, total: int) -> None:
         console.print(f"[dim]Embedded {done}/{total} chunks[/dim]")
 
-    report = index_directory(
-        str(source),
-        rebuild=rebuild,
-        progress=show_progress,
-    )
+    if refresh:
+        report = refresh_repositories(str(source), progress=show_progress)
+    else:
+        report = index_directory(str(source), rebuild=rebuild, progress=show_progress)
     console.print(f"[green]{report.summary()}[/green]")
 
 
@@ -450,6 +522,60 @@ def audit_index(
 
     _, report = scan_directory(str(source))
     console.print(report.summary(audit=True))
+
+
+_CLASSIFICATION_STYLE = {
+    DataClassification.DENY_MODEL: "red",
+    DataClassification.LOCAL_ONLY: "cyan",
+    DataClassification.REMOTE_APPROVED: "yellow",
+}
+
+
+@app.command("policy")
+def policy_command(
+    path: Path = typer.Argument(
+        Path.home() / "Documents",
+        help="Directory to scan for repositories; every Git repo found beneath it is reported",
+    ),
+):
+    """Report each repository's effective model-egress classification, read-only."""
+    target = path.expanduser().resolve()
+    if not target.is_dir():
+        raise typer.BadParameter(f"Not a directory: {target}")
+
+    try:
+        repo_roots = discover_repo_roots(target)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if not repo_roots:
+        console.print(f"[yellow]No Git repositories found under {target}[/yellow]")
+        return
+
+    if shutil.which("gitleaks") is None:
+        console.print(
+            "[bold red]gitleaks is not on PATH[/bold red] — every model call in every "
+            "repository below fails closed until it is installed.\n"
+        )
+
+    remote_approved = 0
+    for repo_root in repo_roots:
+        try:
+            _, classification = load_model_egress_policy(repo_root)
+            label = classification.value
+            color = _CLASSIFICATION_STYLE[classification]
+            if classification is DataClassification.REMOTE_APPROVED:
+                remote_approved += 1
+        except ModelEgressPolicyError as exc:
+            label = f"invalid ({exc})"
+            color = "bold red"
+        console.print(f"[{color}]{label:24}[/{color}] {repo_root}")
+
+    console.print(
+        f"\n[dim]{len(repo_roots)} repositories under {target}; "
+        f"{remote_approved} classified remote-approved. "
+        f"Absent {MODEL_EGRESS_POLICY_FILENAME} defaults to local-only.[/dim]"
+    )
 
 
 if __name__ == "__main__":

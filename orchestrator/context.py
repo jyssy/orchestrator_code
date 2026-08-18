@@ -278,6 +278,35 @@ def _nested_git_roots(source: Path) -> tuple[Path, ...]:
     return tuple(roots)
 
 
+def discover_repo_roots(source: str | Path) -> tuple[Path, ...]:
+    """Find every independent Git repository at or beneath a directory.
+
+    Unlike ``_nested_git_roots``, ``source`` need not already be a repository —
+    this walks an arbitrary directory (e.g. a whole ``~/Documents`` tree) and
+    stops descending as soon as it crosses a ``.git`` boundary, so a found
+    repository's own submodules are not reported as separate roots.
+    """
+    root = Path(source).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"Not a directory: {root}")
+
+    roots: list[Path] = []
+    for directory, directory_names, _ in os.walk(root, followlinks=False):
+        current = Path(directory)
+        if (current / ".git").exists():
+            roots.append(current)
+            directory_names[:] = []
+            continue
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if name != ".git"
+            and not (current / name).is_symlink()
+            and not excluded_directory(current / name)
+        ]
+    return tuple(sorted(roots))
+
+
 def capture_repository_snapshot(repo_root: Path) -> RepositorySnapshot:
     """Capture Git-visible state without reading working-tree file contents."""
     root = repo_root.expanduser().resolve()

@@ -1,5 +1,7 @@
 import json
+import os
 import subprocess
+import time
 from dataclasses import replace
 
 import pytest
@@ -8,10 +10,14 @@ from orchestrator import pipeline
 from orchestrator.approval import (
     consume_approval,
     create_approval,
+    find_latest_plan,
+    find_latest_unconsumed_approval,
     load_approval,
     normalize_allowed_paths,
     path_is_allowed,
+    resolve_latest_execution_records,
     save_approval,
+    save_plan,
     validate_approval,
     validate_approval_location,
     validate_changed_paths,
@@ -276,3 +282,86 @@ def test_cli_approval_location_rejects_a_copied_record(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="canonical approval record"):
         validate_approval_location(copied, approval)
+
+
+def test_find_latest_plan_scopes_to_repository_and_picks_newest(tmp_path):
+    plans_dir = tmp_path / "state" / "plans"
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+
+    older_path = save_plan(make_plan(repo_a, allowed_paths=("a/**",)), plans_dir)
+    newer_path = save_plan(make_plan(repo_a, allowed_paths=("b/**",)), plans_dir)
+    save_plan(make_plan(repo_b), plans_dir)
+    os.utime(older_path, (1_000_000, 1_000_000))
+    os.utime(newer_path, (2_000_000, 2_000_000))
+
+    resolved = find_latest_plan(repo_a, directory=plans_dir)
+
+    assert resolved == newer_path
+
+
+def test_find_latest_plan_raises_when_repository_has_no_plan(tmp_path):
+    plans_dir = tmp_path / "state" / "plans"
+    plans_dir.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="No plan record"):
+        find_latest_plan(tmp_path / "unrelated-repo", directory=plans_dir)
+
+
+def test_find_latest_unconsumed_approval_excludes_consumed_and_scopes_to_repo(tmp_path):
+    approvals_dir = tmp_path / "state" / "approvals"
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    plan_a = make_plan(repo_a)
+
+    save_approval(create_approval(plan_a, "reviewer"), approvals_dir)
+    time.sleep(0.001)
+    newer = create_approval(plan_a, "reviewer")
+    newer_path = save_approval(newer, approvals_dir)
+    time.sleep(0.001)
+    consumed = create_approval(plan_a, "reviewer")
+    consumed_path = save_approval(consumed, approvals_dir)
+    consume_approval(consumed_path, consumed)
+    save_approval(create_approval(make_plan(repo_b), "reviewer"), approvals_dir)
+
+    resolved = find_latest_unconsumed_approval(repo_a, directory=approvals_dir)
+
+    assert resolved == newer_path
+
+
+def test_find_latest_unconsumed_approval_raises_when_none_available(tmp_path):
+    approvals_dir = tmp_path / "state" / "approvals"
+    approvals_dir.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="No unconsumed approval"):
+        find_latest_unconsumed_approval(tmp_path / "unrelated-repo", directory=approvals_dir)
+
+
+def test_resolve_latest_execution_records_pairs_plan_and_approval(tmp_path):
+    plans_dir = tmp_path / "state" / "plans"
+    approvals_dir = tmp_path / "state" / "approvals"
+    repo = tmp_path / "repo"
+    plan = make_plan(repo)
+    plan_path = save_plan(plan, plans_dir)
+    approval_path = save_approval(create_approval(plan, "reviewer"), approvals_dir)
+
+    resolved_plan_path, resolved_approval_path = resolve_latest_execution_records(
+        repo, plans_directory=plans_dir, approvals_directory=approvals_dir
+    )
+
+    assert resolved_plan_path == plan_path
+    assert resolved_approval_path == approval_path
+
+
+def test_resolve_latest_execution_records_requires_matching_plan_file(tmp_path):
+    plans_dir = tmp_path / "state" / "plans"
+    approvals_dir = tmp_path / "state" / "approvals"
+    plans_dir.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    plan = make_plan(repo)
+    save_approval(create_approval(plan, "reviewer"), approvals_dir)  # plan record not saved
+
+    with pytest.raises(ValueError, match="Plan record for latest approval is missing"):
+        resolve_latest_execution_records(
+            repo, plans_directory=plans_dir, approvals_directory=approvals_dir
+        )

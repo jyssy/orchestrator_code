@@ -79,6 +79,61 @@ def load_plan(path: str | Path) -> StructuredPlan:
     return StructuredPlan.from_json(Path(path).expanduser().read_text(encoding="utf-8"))
 
 
+def find_latest_plan(repo_root: Path, *, directory: Path | None = None) -> Path:
+    """Return the most recently written plan record for a repository.
+
+    Scoped to one repository so ``--latest`` cannot pick up a plan created for
+    a different repo just because it happens to be newer.
+    """
+    plans_dir = directory or state_root() / "plans"
+    target = str(repo_root.expanduser().resolve())
+    candidates: list[tuple[float, Path]] = []
+    for path in plans_dir.glob("*.json"):
+        try:
+            plan = load_plan(path)
+        except (OSError, ValueError):
+            continue
+        if plan.repository.repo_root == target:
+            candidates.append((path.stat().st_mtime, path))
+    if not candidates:
+        raise ValueError(f"No plan record found for repository: {target}")
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
+
+def find_latest_unconsumed_approval(repo_root: Path, *, directory: Path | None = None) -> Path:
+    """Return the most recently approved, not-yet-consumed approval for a repository."""
+    approvals_dir = directory or state_root() / "approvals"
+    target = str(repo_root.expanduser().resolve())
+    candidates: list[tuple[str, Path]] = []
+    for path in approvals_dir.glob("*.json"):
+        try:
+            approval = load_approval(path)
+        except (OSError, ValueError):
+            continue
+        if approval.repo_root == target and not approval.consumed_at:
+            candidates.append((approval.approved_at, path))
+    if not candidates:
+        raise ValueError(f"No unconsumed approval found for repository: {target}")
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
+
+def resolve_latest_execution_records(
+    repo_root: Path,
+    *,
+    plans_directory: Path | None = None,
+    approvals_directory: Path | None = None,
+) -> tuple[Path, Path]:
+    """Return (plan_path, approval_path) for the repo's latest unconsumed approval."""
+    approval_path = find_latest_unconsumed_approval(repo_root, directory=approvals_directory)
+    approval = load_approval(approval_path)
+    plan_path = (plans_directory or state_root() / "plans") / f"{approval.plan_id}.json"
+    if not plan_path.is_file():
+        raise ValueError(f"Plan record for latest approval is missing: {plan_path}")
+    return plan_path, approval_path
+
+
 def create_approval(plan: StructuredPlan, approved_by: str) -> ApprovalRecord:
     approver = approved_by.strip()
     if not approver:

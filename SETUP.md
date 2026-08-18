@@ -1,7 +1,15 @@
 # Agentic Coding Environment — Setup Runbook
 
 Architecture: Local Ollama router (qwen2.5:1.5b) + REALMS specialist models
-(Qwen3-Coder-Next / gemma-4-31B-it / gpt-oss-120b) + ChromaDB RAG + MCP server for VS Code.
+(Qwen3-Coder-Next / gemma-4-31B-it / gpt-oss-120b) + ChromaDB RAG + an MCP
+server any MCP-capable IDE or agent can register (Zed, Claude Code, Codex, ...).
+
+This is installation only: getting Ollama, the Python environment, and MCP
+registration in place. It is IDE-agnostic — the orchestrator itself has no
+editor dependency, and Phase 3 below registers it once per client using the
+same stdio pattern regardless of which editor you use. For which command to
+run day to day and what repository/read/write/model-egress permissions it
+carries, see [`DIRECTIONS.md`](DIRECTIONS.md).
 
 ---
 
@@ -50,24 +58,7 @@ ollama run qwen2.5:1.5b "classify this as one word — coding ops search or gene
 
 ---
 
-## Phase 2 — Continue.dev
-
-Install the Continue.dev extension in VS Code:
-- Open VS Code → Extensions (⇧⌘X) → search `Continue` → install `Continue (ms-continue.continue)`
-
-The config file is already written at `~/.continue/config.yaml`.
-It wires REALMS models (coder, large-context, 120B) and Ollama local models
-into Continue's model picker and tab-autocomplete.
-
-**Verify:**
-- Open a code file in VS Code
-- Press `⌥⌘J` (or click Continue in the sidebar)
-- The model picker should show `Qwen3-Coder (REALMS)` and `Gemma 4 31B`
-- Tab autocomplete should trigger inline using Qwen3-Coder-Next via REALMS
-
----
-
-## Phase 3 — Python orchestrator
+## Phase 2 — Python orchestrator
 
 From this directory (`orchestrator_code/`):
 
@@ -84,6 +75,23 @@ source .venv/bin/activate
 # Confirm the mandatory local scanner is available
 gitleaks version
 ```
+
+**Put the orchestrator on `PATH` once, so it works from any repository.**
+Add this to `~/.zshrc` (or the equivalent for your shell), then open a new
+terminal or `source ~/.zshrc`:
+
+```sh
+export PATH="/path/to/orchestrator_code/.venv/bin:$PATH"
+```
+
+Without this, `orchestrate` only resolves correctly via `uv run orchestrate`
+run from inside this directory, or via the absolute
+`/path/to/orchestrator_code/.venv/bin/orchestrate` path spelled out every
+time. With it on `PATH`, plain `orchestrate` works from any directory,
+including the repository you're actually working in — which matters because
+most commands infer their target repository from your current directory. See
+["Do you need `--repo-root`, or is cwd enough?"](DIRECTIONS.md#do-you-need---repo-root-or-is-cwd-enough)
+in `DIRECTIONS.md` for exactly how that inference works.
 
 Before repository content can be sent to REALMS, copy the example policy into
 that target repository and explicitly authorize the destination:
@@ -112,291 +120,30 @@ Expected output:
 - Draft answer from Qwen3-Coder-Next
 - Revised answer (if judge found issues) from gpt-oss-120b
 
-**Audit, then build the RAG index** (run once, re-run after large changes):
+**Build the RAG index once**, to confirm indexing works end to end:
 ```sh
 uv run orchestrate audit-index /path/to/workspace
 uv run orchestrate index /path/to/workspace --rebuild
 ```
 
-The audit makes no model calls. Indexing accepts only repositories explicitly
-classified `remote-approved`, prunes generated environments and caches, honors
-Git ignores and `.orchestratorignore`, rejects secret-bearing paths and content,
-and passes each chunk through Gitleaks before Qwen3-Embedding-8B. The sanitized
-index is stored in `~/.orchestrator/chroma`. Phase 2A retrieval rejects legacy
-chunks without current egress-policy metadata, so perform one authorized full
-`--rebuild` after upgrading. This implementation does not run that rebuild.
-Rebuild is the safe default. Use `--resume` only after an interrupted run and only
-when the source tree has not changed.
+Indexing only accepts repositories explicitly classified `remote-approved`, so
+point this at the same repository you just authorized above. `--rebuild`
+deletes and replaces the **entire** shared index across every repo you've
+indexed, not just this one — for the full explanation, the cheaper `--refresh`
+mode for updating a single repo, and when to use `--resume`, see
+["Audit, rebuild, or refresh the RAG index"](DIRECTIONS.md#audit-rebuild-or-refresh-the-rag-index)
+in `DIRECTIONS.md`. This step here is only a smoke test that the pipeline and
+ChromaDB are wired up correctly.
 
-Retrieved chunks are labelled with their source and can be restricted to one Git
-repository with `--repo-root`. Effective `AGENTS.md` guidance and read-only Git
-state are loaded deterministically before RAG context.
-
-## Quick Start — guarded coding workflow
-
-Two executors are available. Codex is the default for both `work` and
-`execute`; call out `--executor claude` explicitly any time Claude Code should
-run instead:
-
-| Executor | Command | How it runs |
-|---|---|---|
-| **Codex** (default) | `orchestrate work "task"` | Read-only planning subprocess |
-| **Claude Code** | `orchestrate work "task" --executor claude` | Read-only planning subprocess |
-
-`work` is now the compatibility planning launcher. For an implementation, use
-the enforced three-step workflow:
-
-```sh
-orchestrate plan "describe the change" --repo-root /path/to/repo --allow 'src/**' --allow 'tests/**'
-
-# Copy the exact Plan record path printed above.
-PLAN_FILE=/exact/path/printed/by/plan
-orchestrate approve "$PLAN_FILE"
-
-# Copy the exact Approval record path printed by approve.
-APPROVAL_FILE=/exact/path/printed/by/approve
-orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --print-only
-
-# Codex is the default executor; omit --executor to get it.
-orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --executor codex
-
-# Pass --executor claude explicitly to run Claude Code instead of Codex.
-orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --executor claude
-```
-
-Both `work` and `execute` accept `--executor claude` (short form `-e claude`)
-to select Claude Code for that one invocation. The default stays Codex unless
-you pass this flag — there is no environment variable or config file override,
-so specify it on every command where Claude should run. Add
-`--add-dir /path/to/other/directory` (repeatable) on either command to let
-that Claude Code session read files outside the target repository, e.g. a
-shared library that lives in a sibling directory; it has no effect for Codex.
-
-See [`PLAN_APPROVAL_WORKFLOW.md`](PLAN_APPROVAL_WORKFLOW.md) for record formats,
-drift checks, constraints, scope validation, and limitations.
+Installation is complete once that smoke test and index build succeed. For the
+full command reference, the guarded plan/approve/execute workflow, and the
+multi-repo permissions model, see [`DIRECTIONS.md`](DIRECTIONS.md).
 
 ---
 
-## Command directions and quick reference
+## Phase 3 — MCP server (any MCP-capable client)
 
-Choose the command based on the intended outcome:
-
-| Command | Use it for | Repository changes or side effects |
-|---|---|---|
-| `ask` | Read-only questions and analysis | No repository edits; may call configured model and RAG services |
-| `plan` | A repository-aware plan; `--allow` creates a structured record | No target-repository edits or executor launch |
-| `approve` | Explicitly approve an unchanged structured plan | Writes a private user-local approval record |
-| `execute` | Launch Codex or Claude for a valid approval | Consumes approval and permits scoped repository edits |
-| `work` | Compatibility planning launcher | Launches an agent with read-only permissions |
-| `audit-index` | Preview what is safe to index | Read-only safety scan; no model API or Chroma write |
-| `index` | Build or update the sanitized RAG index | Writes the local Chroma index and may call the embedding service |
-
-There are two supported ways to invoke the CLI:
-
-```sh
-# From the orchestrator repository:
-uv run orchestrate --help
-
-# From any directory, including a target repository:
-/path/to/orchestrator_code/.venv/bin/orchestrate --help
-```
-
-Use the absolute executable when working from another repository. The examples
-below define a short shell variable only to keep the commands readable:
-
-```sh
-ORCHESTRATE_BIN=/path/to/orchestrator_code/.venv/bin/orchestrate
-```
-
-### Ask: read-only questions and analysis
-
-`ask` does not infer repository context from the current directory. Always pass
-`--repo-root` when the answer should include effective `AGENTS.md`, read-only Git
-state, and repository-scoped RAG context.
-
-```sh
-cd /path/to/target-repository
-
-# Repository-aware question
-$ORCHESTRATE_BIN ask \
-  "explain how this application is deployed" \
-  --repo-root "$PWD"
-
-# Include one safe file from the repository as additional context
-$ORCHESTRATE_BIN ask \
-  "explain how this inventory controls deployment" \
-  --repo-root "$PWD" \
-  --file "$PWD/ansible/hosts"
-
-# Skip the critique/revision pass for a faster answer
-$ORCHESTRATE_BIN ask \
-  "summarize the dependency-management workflow" \
-  --repo-root "$PWD" \
-  --no-judge
-
-# Compatibility workflow: show a plan, request confirmation, then produce advice
-$ORCHESTRATE_BIN ask \
-  "describe how to refactor this component" \
-  --repo-root "$PWD" \
-  --plan
-```
-
-`ask --plan` does not launch a code executor. Prefer `plan` for plan-only output,
-`work` for an interactive read-only planning agent, and `plan --allow` followed
-by `approve` and `execute` when implementation may follow. Setting
-`PLAN_FIRST=true` applies the compatibility plan-and-confirm advisory behavior
-to every `ask` call.
-
-### Plan: produce a plan without implementation
-
-`plan` infers the current Git repository when `--repo-root` is omitted. Passing
-it explicitly is recommended in scripts and documentation.
-
-```sh
-cd /path/to/target-repository
-
-# Repository-aware plan
-$ORCHESTRATE_BIN plan \
-  "describe the proposed coding or operations change" \
-  --repo-root "$PWD"
-
-# Include one safe repository file as additional context
-$ORCHESTRATE_BIN plan \
-  "propose a narrowly scoped inventory change" \
-  --repo-root "$PWD" \
-  --file "$PWD/ansible/hosts"
-```
-
-The command prints the plan and exits. Its output is a proposal, not approval
-to implement it. Add one or more `--allow` values to create a structured plan
-record suitable for the separate `approve` and `execute` commands.
-
-### Approve and execute a structured plan
-
-The `plan --allow` command prints a plan ID and the exact plan-record path. Read
-the proposal and JSON record before continuing. Copy that path exactly:
-
-```sh
-PLAN_FILE=/exact/path/printed/by/plan
-$ORCHESTRATE_BIN approve "$PLAN_FILE" --approved-by reviewer-name
-```
-
-`approve` rechecks repository and policy state, then prints the canonical
-approval-record path. Copy that path exactly; copied approval files are rejected.
-Validate immediately before execution:
-
-```sh
-APPROVAL_FILE=/exact/path/printed/by/approve
-$ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" --print-only
-
-# Remove --print-only only after reviewing the validated command.
-# Codex is the default; this is equivalent to omitting --executor.
-$ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" --executor codex
-
-# To run Claude Code instead of Codex, pass --executor claude explicitly.
-$ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" --executor claude
-
-# Let that Claude Code session also read a directory outside the target repo:
-$ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" \
-  --executor claude \
-  --add-dir /path/to/shared-library
-```
-
-If drift is reported, generate and approve a new plan. If execution fails or is
-interrupted, the approval stays consumed; inspect the repository before starting
-a newly planned and approved attempt. Scope failures are not rolled back.
-
-Plan records can contain model-generated text derived from repository context,
-along with task, path, policy-source, constraint, and approver metadata. Review
-them before sharing; do not commit them to the target repository.
-
-New plans also bind `.orchestrator-policy.toml` (including its absent state) into
-the policy fingerprint. Regenerate Phase 1 plan records after this upgrade.
-Changing repository classification after planning invalidates approval.
-
-### Work: compatibility read-only planning
-
-`work` infers the current Git repository when `--repo-root` is omitted.
-
-```sh
-cd /path/to/target-repository
-
-# Codex — read-only planning subprocess (default; requires Codex CLI installed)
-$ORCHESTRATE_BIN work \
-  "describe the coding change and what done means"
-
-# Claude Code — pass --executor claude explicitly to select it over the Codex default
-$ORCHESTRATE_BIN work \
-  "describe the coding change and what done means" \
-  --executor claude
-
-# Claude Code, also permitted to read a directory outside the target repository
-$ORCHESTRATE_BIN work \
-  "describe the coding change and what done means" \
-  --executor claude \
-  --add-dir /path/to/shared-library
-
-# Preview the planning prompt without launching the planning agent
-$ORCHESTRATE_BIN work \
-  "describe the coding change and what done means" \
-  --repo-root "$PWD" \
-  --print-only
-```
-
-The planning process cannot be elevated into execution. Use the structured
-`plan --allow`, `approve`, and `execute` lifecycle for implementation.
-
-### Audit or rebuild the RAG index
-
-Run `audit-index` before `index`. Use `--resume` only for an interrupted scan
-whose source has not changed.
-
-```sh
-# Read-only safety audit
-$ORCHESTRATE_BIN audit-index /path/to/workspace
-
-# Sanitized full rebuild (safe default)
-$ORCHESTRATE_BIN index /path/to/workspace --rebuild
-
-# Resume an interrupted scan only when its source is unchanged
-$ORCHESTRATE_BIN index /path/to/workspace --resume
-```
-
-### Discover every option
-
-```sh
-$ORCHESTRATE_BIN --help
-$ORCHESTRATE_BIN ask --help
-$ORCHESTRATE_BIN plan --help
-$ORCHESTRATE_BIN approve --help
-$ORCHESTRATE_BIN execute --help
-$ORCHESTRATE_BIN work --help
-$ORCHESTRATE_BIN audit-index --help
-$ORCHESTRATE_BIN index --help
-```
-
----
-
-## Guarded implementation workflow details
-
-Do not run two executors against the same repository at the same time. Generate
-a structured plan with explicit allowed paths, review it, create an approval,
-and execute it in a new process. Codex uses `workspace-write` only for the
-approved execution process; Claude uses `acceptEdits` only at that stage.
-
-Approval is invalidated if the commit, initial working tree, or effective policy
-changes. The approval is single-use and is consumed before executor launch.
-After execution, the CLI rejects commits and reports Git-visible paths outside
-the allowlist. It does not automatically roll changes back.
-
-See [`PLAN_APPROVAL_WORKFLOW.md`](PLAN_APPROVAL_WORKFLOW.md) for the complete
-workflow and its current limitations.
-
----
-
-## Phase 4 — MCP server (Codex and Claude Code integration)
-
-The MCP server exposes seven tools that Codex, Claude Code, and other MCP
+The MCP server exposes seven tools that Codex, Claude Code, Zed, and other MCP
 clients can call:
 
 - `ask_orchestrator` — routes a prompt through the full pipeline and returns the answer; pass `use_judge=false` for a faster single-pass response
@@ -411,8 +158,8 @@ The server is advisory. It does not edit files or run commands. Codex or another
 coding agent must apply the response and perform validation.
 
 **Recommended enforced workflow:** use the CLI `plan --allow`, `approve`, and
-`execute` lifecycle documented above. It binds approval to structured records
-and current repository and policy state.
+`execute` lifecycle documented in [`DIRECTIONS.md`](DIRECTIONS.md). It binds
+approval to structured records and current repository and policy state.
 
 **Compatibility advisory workflow:** an MCP client may call `plan_task`, stop for
 human review, and later call `ask_orchestrator` with the same task, `repo_root`,
@@ -421,6 +168,22 @@ or consume the canonical approval record and does not launch the executor.
 `ask_orchestrator` still returns the final answer as plain text for existing
 clients. Call `ask_orchestrator_structured` when the client must distinguish a
 normal result from degraded operation or a sanitized failure.
+
+### The general registration pattern
+
+Every MCP client that supports local stdio servers needs the same two things:
+the Python interpreter in this repo's venv (`.venv/bin/python`) and the
+absolute path to `mcp_server.py`. Nothing else is required — `mcp_server.py`
+loads `.env` from its own directory (`Path(__file__).parent / ".env"`), not
+from the client's working directory, so no client needs to set a working
+directory or activate the venv itself. That is why each client-specific
+section below is short: register the same command using whatever config
+format that one client expects.
+
+If your client launches the server without inheriting your interactive shell
+— true of most GUI apps, including Zed, which do not source `~/.zshrc` —
+rely on `.env` for `REALMS_API_KEY` rather than the shell export.
+`mcp_server.py` reads `.env` directly regardless of how it was launched.
 
 **Optional diagnostic start:**
 ```sh
@@ -443,6 +206,31 @@ authentication failure, invalid requests, and invalid retry configuration are
 never retried. Public diagnostics contain fixed status and reason codes; they do
 not contain prompts, source chunks, credentials, provider bodies, scanner
 output, or unrestricted exception text.
+
+### Register with Zed
+
+Zed calls MCP servers "context servers." Open Zed's settings with the command
+palette action `zed: open settings file` (global settings, typically
+`~/.config/zed/settings.json`; a project-level `.zed/settings.json` also
+works), or through **Settings → AI → MCP Servers → Add Server → Add Local
+Server**:
+
+```json
+{
+  "context_servers": {
+    "orchestrator": {
+      "command": "/path/to/orchestrator_code/.venv/bin/python",
+      "args": ["/path/to/orchestrator_code/mcp_server.py"],
+      "env": {}
+    }
+  }
+}
+```
+
+Zed's context-server config has no working-directory field — none is needed
+here; see the general pattern above. Prefer setting `REALMS_API_KEY` in
+`.env` over Zed's `env` block so the credential isn't duplicated into a
+settings file you might sync or share.
 
 ### Register with Codex
 
@@ -526,37 +314,9 @@ ansible/vault*
 
 This is defense in depth, not enforcement — the orchestrator guards its own
 model calls and the initial CLI-generated agent prompt, but not later file
-reads by Claude, Codex, Continue, or other editor extensions. Use a sanitized
+reads by Claude, Codex, Zed, or other editor extensions. Use a sanitized
 worktree or OS/container file boundary where those tools must be unable to
 access secret-bearing files.
-
----
-
-## Human gates — what always requires your approval
-
-Consistent with repo-level AGENTS.md conventions across this workspace:
-
-| Action | Gate |
-|---|---|
-| `terraform apply` / `plan` | Always human-run |
-| `ansible-playbook` execution | Always human-run from bastion |
-| Database migrations (`migrate`) | Explicit approval + DBA review |
-| Git push / merge / tag / release | Explicit approval |
-| Vault / credential / secret changes | Explicit approval |
-| Production service restarts | Explicit approval |
-| Submodule pointer updates | Separately scoped task |
-
-The orchestrator will **propose** these actions in its plan output but will never execute them.
-The calling agent must also leave any validation command prohibited by the
-effective repository `AGENTS.md` pending for an authorized human.
-
-Keep Git actions separate from implementation. Let the agent use read-only
-inspection commands such as `git status`, `git diff`, and `git diff --check`.
-After reviewing the handoff, request a local commit explicitly if wanted:
-
-> Create one local commit for the approved changes. Do not push.
-
-Authorize pushes, merges, tags, releases, or deployments as separate actions.
 
 ---
 
@@ -564,7 +324,7 @@ Authorize pushes, merges, tags, releases, or deployments as separate actions.
 
 | What's running | Memory used |
 |---|---|
-| macOS + VS Code + Chrome | ~4–5 GB |
+| macOS + editor (Zed/VS Code) + Chrome | ~4–5 GB |
 | qwen2.5:1.5b (router, always resident) | ~1 GB |
 | qwen2.5-coder:7b (loaded on demand) | ~4.5 GB |
 | ChromaDB + Python process | ~0.5 GB |
@@ -601,11 +361,13 @@ seconds for startup and 300 seconds for an orchestrator tool call.
 **Judge pass is slow:** Set `JUDGE_ENABLED=false` in `.env` or pass `--no-judge` to the CLI.
 
 **RAG returns empty context:** Confirm `repo_root` matches the indexed Git root,
-then run `uv run python cli.py audit-index` followed by
-`uv run python cli.py index /path/to/source --rebuild`.
+then run `orchestrate audit-index /path/to/source` followed by
+`orchestrate index /path/to/source --rebuild`.
 
 **A context file is refused:** Do not bypass the safety filter. Vault, password,
 credential, environment, private-key, and Terraform-state files must remain
 outside model context.
 
-**Continue.dev models not appearing:** Reload VS Code window (`⇧⌘P` → `Developer: Reload Window`).
+**Zed doesn't show the orchestrator's tools:** Confirm the `context_servers`
+block in Zed's settings uses absolute paths (not `~`), then reload the window
+or restart Zed. Check **Settings → AI → MCP Servers** for a connection error.

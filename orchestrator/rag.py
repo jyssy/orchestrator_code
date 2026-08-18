@@ -467,26 +467,13 @@ def retrieve_context(query: str, repo_root: str | None = None) -> str:
     return result.value or ""
 
 
-def index_directory(
-    source_dir: str,
-    *,
-    rebuild: bool = True,
-    progress: Callable[[int, int], None] | None = None,
-) -> IndexReport:
-    """
-    Scan, embed, and persist safe files.
-
-    With rebuild=True, the existing collection is deleted before any safe chunks
-    are stored, ensuring stale or previously unsafe entries cannot survive.
-    """
-    files, report = scan_directory(source_dir)
-    report.rebuilt = rebuild
-
+def _chunk_files(
+    files: list[IndexFile], source_root: str
+) -> tuple[list[str], list[str], list[dict]]:
+    """Split accepted files into chunks with their IDs and metadata."""
     chunks: list[str] = []
     ids: list[str] = []
     metadatas: list[dict] = []
-    source_root = str(Path(source_dir).expanduser().resolve())
-
     for item in files:
         for offset in range(0, len(item.text), _CHUNK_SIZE):
             chunk = item.text[offset : offset + _CHUNK_SIZE]
@@ -502,6 +489,61 @@ def index_directory(
                     "egress_policy_version": _EGRESS_POLICY_VERSION,
                 }
             )
+    return chunks, ids, metadatas
+
+
+def _embed_and_upsert(
+    collection,
+    chunks: list[str],
+    ids: list[str],
+    metadatas: list[dict],
+    *,
+    progress: Callable[[int, int], None] | None,
+) -> int:
+    """Embed and upsert chunks in batches, re-checking policy each batch."""
+    total = len(chunks)
+    for start in range(0, total, _EMBED_BATCH_SIZE):
+        batch_chunks = chunks[start : start + _EMBED_BATCH_SIZE]
+        batch_metadatas = metadatas[start : start + _EMBED_BATCH_SIZE]
+        for repo_root in {item["repo_root"] for item in batch_metadatas}:
+            if (
+                load_data_classification(Path(repo_root))
+                is not DataClassification.REMOTE_APPROVED
+            ):
+                raise ModelEgressBlocked(
+                    "Repository policy changed before RAG embedding transmission"
+                )
+        with egress_scope(DataClassification.REMOTE_APPROVED):
+            embeddings = _embed(batch_chunks)
+        collection.upsert(
+            documents=batch_chunks,
+            embeddings=embeddings,
+            ids=ids[start : start + _EMBED_BATCH_SIZE],
+            metadatas=batch_metadatas,
+        )
+        if progress:
+            progress(min(start + _EMBED_BATCH_SIZE, total), total)
+    return total
+
+
+def index_directory(
+    source_dir: str,
+    *,
+    rebuild: bool = True,
+    progress: Callable[[int, int], None] | None = None,
+) -> IndexReport:
+    """
+    Scan, embed, and persist safe files.
+
+    With rebuild=True, the existing collection is deleted before any safe chunks
+    are stored, ensuring stale or previously unsafe entries cannot survive. This
+    re-embeds every accepted file across the whole collection, not only
+    source_dir — see refresh_repositories() for a cheaper, repo-scoped update.
+    """
+    files, report = scan_directory(source_dir)
+    report.rebuilt = rebuild
+    source_root = str(Path(source_dir).expanduser().resolve())
+    chunks, ids, metadatas = _chunk_files(files, source_root)
 
     # Complete all mandatory local scans before mutating the persistent index.
     for chunk in chunks:
@@ -524,28 +566,50 @@ def index_directory(
         ids = [ids[index] for index in retained]
         metadatas = [metadatas[index] for index in retained]
 
-    total = len(chunks)
-    report.uploaded_chunks = total
-    for start in range(0, total, _EMBED_BATCH_SIZE):
-        batch_chunks = chunks[start : start + _EMBED_BATCH_SIZE]
-        batch_metadatas = metadatas[start : start + _EMBED_BATCH_SIZE]
-        for repo_root in {item["repo_root"] for item in batch_metadatas}:
-            if (
-                load_data_classification(Path(repo_root))
-                is not DataClassification.REMOTE_APPROVED
-            ):
-                raise ModelEgressBlocked(
-                    "Repository policy changed before RAG embedding transmission"
-                )
-        with egress_scope(DataClassification.REMOTE_APPROVED):
-            embeddings = _embed(batch_chunks)
-        collection.upsert(
-            documents=batch_chunks,
-            embeddings=embeddings,
-            ids=ids[start : start + _EMBED_BATCH_SIZE],
-            metadatas=metadatas[start : start + _EMBED_BATCH_SIZE],
-        )
-        if progress:
-            progress(min(start + _EMBED_BATCH_SIZE, total), total)
+    report.uploaded_chunks = _embed_and_upsert(
+        collection, chunks, ids, metadatas, progress=progress
+    )
+    return report
 
+
+def refresh_repositories(
+    source_dir: str,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> IndexReport:
+    """
+    Delete and re-embed only the chunks whose repository appears in this scan.
+
+    Cheaper than index_directory(rebuild=True) across a large workspace: every
+    other previously indexed repository is left untouched. Still re-embeds
+    every accepted file in the scanned repositories regardless of whether its
+    content changed, because chunk IDs are not content-addressed (path and
+    offset only) — this fixes edited and deleted files, unlike rebuild=False,
+    but at the cost of re-embedding the whole scanned repository each time.
+
+    A repository with zero accepted files in this scan (e.g. everything now
+    excluded or reclassified) is not detected here and keeps its prior stale
+    chunks; use index_directory(rebuild=True) on the full workspace to clear
+    that case.
+    """
+    files, report = scan_directory(source_dir)
+    report.rebuilt = False
+    source_root = str(Path(source_dir).expanduser().resolve())
+    chunks, ids, metadatas = _chunk_files(files, source_root)
+
+    # Complete all mandatory local scans before mutating the persistent index.
+    for chunk in chunks:
+        guard_text(chunk, source="RAG index chunk")
+
+    _INDEX_PATH.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(_INDEX_PATH))
+    collection = client.get_or_create_collection(_COLLECTION_NAME)
+
+    repo_roots = sorted({metadata["repo_root"] for metadata in metadatas})
+    if repo_roots:
+        collection.delete(where={"repo_root": {"$in": repo_roots}})
+
+    report.uploaded_chunks = _embed_and_upsert(
+        collection, chunks, ids, metadatas, progress=progress
+    )
     return report

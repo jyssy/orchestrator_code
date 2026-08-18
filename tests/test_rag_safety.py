@@ -129,6 +129,82 @@ def test_rebuild_stores_only_safe_repo_scoped_chunks(tmp_path, monkeypatch):
     assert resumed.uploaded_chunks == 0
 
 
+def test_refresh_updates_only_the_scanned_repository(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    repo_a = workspace / "repo-a"
+    repo_b = workspace / "repo-b"
+    for repo in (repo_a, repo_b):
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".orchestrator-policy.toml").write_text(
+            '[model_egress]\nclassification = "remote-approved"\n'
+        )
+    file_a = repo_a / "main.py"
+    file_a.write_text("def original_a():\n    return 'a1'\n")
+    file_b = repo_b / "main.py"
+    file_b.write_text("def original_b():\n    return 'b1'\n")
+
+    monkeypatch.setattr(rag, "_INDEX_PATH", tmp_path / "chroma")
+    monkeypatch.setattr(rag, "_embed", lambda texts: [[1.0, 0.0, 0.0] for _ in texts])
+    monkeypatch.setattr(
+        rag,
+        "_rerank_result",
+        lambda query, documents: ComponentResult(
+            "reranker", ResultStatus.SUCCESS, list(range(len(documents)))
+        ),
+    )
+    monkeypatch.setattr(rag, "guard_text", lambda text, **kwargs: None)
+
+    # Full rebuild across the whole workspace, indexing both repos.
+    rag.index_directory(str(workspace), rebuild=True)
+    assert "original_a" in rag.retrieve_context("original", repo_root=str(repo_a))
+    assert "original_b" in rag.retrieve_context("original", repo_root=str(repo_b))
+
+    # Edit repo_a only, then refresh scoped to repo_a alone.
+    file_a.write_text("def edited_a():\n    return 'a2'\n")
+    report = rag.refresh_repositories(str(repo_a))
+
+    assert report.indexed_files == 1
+    assert report.uploaded_chunks == 1
+
+    # repo_a reflects the edit; repo_b is untouched by the repo_a-scoped refresh.
+    context_a = rag.retrieve_context("edited", repo_root=str(repo_a))
+    assert "edited_a" in context_a
+    assert "original_a" not in context_a
+    assert "original_b" in rag.retrieve_context("original", repo_root=str(repo_b))
+
+
+def test_refresh_removes_chunks_for_files_no_longer_present(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".orchestrator-policy.toml").write_text(
+        '[model_egress]\nclassification = "remote-approved"\n'
+    )
+    stale_file = repo / "stale.py"
+    stale_file.write_text("def stale_marker():\n    return True\n")
+
+    monkeypatch.setattr(rag, "_INDEX_PATH", tmp_path / "chroma")
+    monkeypatch.setattr(rag, "_embed", lambda texts: [[1.0, 0.0, 0.0] for _ in texts])
+    monkeypatch.setattr(
+        rag,
+        "_rerank_result",
+        lambda query, documents: ComponentResult(
+            "reranker", ResultStatus.SUCCESS, list(range(len(documents)))
+        ),
+    )
+    monkeypatch.setattr(rag, "guard_text", lambda text, **kwargs: None)
+
+    rag.index_directory(str(repo), rebuild=True)
+    assert "stale_marker" in rag.retrieve_context("stale", repo_root=str(repo))
+
+    stale_file.unlink()
+    (repo / "kept.py").write_text("def kept_marker():\n    return True\n")
+    rag.refresh_repositories(str(repo))
+
+    context = rag.retrieve_context("marker", repo_root=str(repo))
+    assert "kept_marker" in context
+    assert "stale_marker" not in context
+
+
 def test_retrieval_rejects_legacy_chunks_without_current_policy_metadata(
     tmp_path, monkeypatch
 ):

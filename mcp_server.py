@@ -1,9 +1,9 @@
 """
 mcp_server.py — exposes the orchestrator pipeline as MCP tools
-so Codex, Claude Code, and other MCP clients can call it.
+so Zed, Codex, Claude Code, and other MCP clients can call it.
 
 Start with: uv run python mcp_server.py
-Register with Codex or Claude Code (see SETUP.md Phase 4).
+Register with any MCP-capable client (see SETUP.md Phase 3).
 """
 
 import os
