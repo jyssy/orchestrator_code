@@ -4,14 +4,46 @@ import httpx
 import pytest
 
 import mcp_server
-from orchestrator import judge, model_gateway, pipeline, rag, router
-from orchestrator.egress_guard import ModelContentBlocked
+from orchestrator import judge, model_gateway, pipeline, rag, router, specialists
+from orchestrator.egress_guard import ModelContentBlocked, RemoteTransmissionDenied
 from orchestrator.model_gateway import ProviderFailure
 from orchestrator.results import ComponentResult, ResultStatus
 
 
 def _messages():
     return [{"role": "user", "content": "ordinary request"}]
+
+
+def test_configured_coding_model_is_used_and_reported(monkeypatch):
+    received = {}
+    monkeypatch.setenv("REALMS_CODING_MODEL", "replacement-coder")
+
+    def fake_realms(model, messages, **kwargs):
+        received["model"] = model
+        return "answer"
+
+    monkeypatch.setattr(specialists, "_realms", fake_realms)
+
+    result = specialists.code_result("prompt")
+
+    assert received["model"] == "replacement-coder"
+    assert result.model == "replacement-coder"
+
+
+def test_local_coding_fallback_is_reported_as_the_used_model(monkeypatch):
+    monkeypatch.setenv("OLLAMA_CODING_MODEL", "replacement-local-coder")
+    monkeypatch.setattr(
+        specialists,
+        "_realms",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RemoteTransmissionDenied("local-only")
+        ),
+    )
+    monkeypatch.setattr(specialists, "_local", lambda *args, **kwargs: "answer")
+
+    result = specialists.code_result("prompt")
+
+    assert result.model == "replacement-local-coder"
 
 
 def test_remote_gateway_retries_only_transient_failures(monkeypatch):
@@ -178,6 +210,15 @@ def test_missing_index_and_no_matches_are_distinct(tmp_path, monkeypatch):
     assert result.code == "rag_no_matches"
 
 
+def test_planner_and_judge_prompts_instruct_against_fabrication():
+    assert "is not present in the provided context" in pipeline._PLAN_SYSTEM
+    assert "flag that as a likely fabrication" in judge._CRITIQUE_SYSTEM
+    assert (
+        "the information is not present in the provided context"
+        in judge._REVISE_SYSTEM
+    )
+
+
 def test_reranker_fallback_is_visible(monkeypatch):
     monkeypatch.setattr(
         rag,
@@ -253,14 +294,17 @@ def _patch_pipeline_success(monkeypatch, retrieval_result):
         pipeline,
         "code_result",
         lambda *args, **kwargs: ComponentResult(
-            "specialist", ResultStatus.SUCCESS, "answer"
+            "specialist",
+            ResultStatus.SUCCESS,
+            "answer",
+            model="Qwen3-Coder-Next",
         ),
     )
     monkeypatch.setattr(
         pipeline,
         "critique_and_revise_result",
         lambda *args, **kwargs: ComponentResult(
-            "judge", ResultStatus.SUCCESS, "answer"
+            "judge", ResultStatus.SUCCESS, "answer", model="gpt-oss-120b"
         ),
     )
 
@@ -280,6 +324,15 @@ def test_pipeline_returns_answer_with_visible_retrieval_degradation(monkeypatch)
 
     assert result["status"] == "degraded_success"
     assert result["final"] == "answer"
+    assert result["model_roles"] == {
+        "reviewer": "Qwen3-Coder-Next",
+        "judge": "gpt-oss-120b",
+    }
+    assert next(
+        component
+        for component in result["components"]
+        if component["component"] == "specialist"
+    )["model"] == "Qwen3-Coder-Next"
     assert result["retrieval_used"] is False
     assert result["warnings"][0]["code"] == "rag_index_missing"
 
@@ -338,10 +391,14 @@ def test_empty_prompt_is_an_explicit_invalid_input():
     assert result["error"]["code"] == "empty_prompt"
 
 
-def test_mcp_plain_text_compatibility_and_structured_diagnostics(monkeypatch):
+def test_mcp_text_and_structured_responses_include_model_attribution(monkeypatch):
     response = {
         "status": "degraded_success",
         "final": "answer text",
+        "model_roles": {
+            "reviewer": "Qwen3-Coder-Next",
+            "judge": "gpt-oss-120b",
+        },
         "warnings": [
             {
                 "component": "retrieval",
@@ -352,5 +409,7 @@ def test_mcp_plain_text_compatibility_and_structured_diagnostics(monkeypatch):
     }
     monkeypatch.setattr(mcp_server, "run", lambda *args, **kwargs: response)
 
-    assert mcp_server.ask_orchestrator("prompt") == "answer text"
+    assert mcp_server.ask_orchestrator("prompt") == (
+        "Reviewer (Qwen3-Coder-Next) | Judge (gpt-oss-120b)\n\nanswer text"
+    )
     assert mcp_server.ask_orchestrator_structured("prompt") == response

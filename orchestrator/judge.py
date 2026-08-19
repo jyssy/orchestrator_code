@@ -7,6 +7,7 @@ import os
 
 from orchestrator.egress_guard import ModelEgressBlocked
 from orchestrator.model_gateway import ProviderFailure
+from orchestrator.model_roles import reasoning_model
 from orchestrator.results import ComponentResult, ResultStatus, diagnostic
 from orchestrator.specialists import reason
 
@@ -16,10 +17,17 @@ Given a user request and a draft answer, identify:
 2. Missing edge cases or security issues
 3. Unnecessary complexity
 
+If the draft states or implies file/module contents, APIs, or configuration that
+are not verifiable from the provided context, flag that as a likely fabrication
+rather than treating it as a correctness detail.
+
 Be concise. If the answer is correct and complete, reply with exactly: LGTM"""
 
 _REVISE_SYSTEM = """You are an expert technical assistant.
 Revise the draft answer based on the critique provided.
+If the critique flags fabricated or unverifiable content, replace it with an
+explicit statement that the information is not present in the provided context
+rather than inventing a replacement.
 Return only the improved answer."""
 
 
@@ -93,6 +101,7 @@ def _fallback_result(
         message=message,
         attempts=attempts,
         warnings=(diagnostic("judge", code, message),),
+        model=reasoning_model(),
     )
 
 
@@ -139,6 +148,7 @@ def critique_and_revise_result(
             draft,
             code="judge_disabled",
             message="The judge pass was disabled for this request.",
+            model=reasoning_model(),
         )
 
     critique_prompt = f"User request:\n{prompt}\n\nDraft answer:\n{draft}"
@@ -157,7 +167,9 @@ def critique_and_revise_result(
         return _fallback_result(draft, None, revision=False)
 
     if critique.strip().upper().startswith("LGTM"):
-        return ComponentResult("judge", ResultStatus.SUCCESS, draft)
+        return ComponentResult(
+            "judge", ResultStatus.SUCCESS, draft, model=reasoning_model()
+        )
 
     revision_prompt = (
         f"User request:\n{prompt}\n\n"
@@ -178,4 +190,6 @@ def critique_and_revise_result(
         return _fallback_result(draft, exc, revision=True)
     except Exception:  # noqa: BLE001 - retain draft with a content-safe warning
         return _fallback_result(draft, None, revision=True)
-    return ComponentResult("judge", ResultStatus.SUCCESS, revised)
+    return ComponentResult(
+        "judge", ResultStatus.SUCCESS, revised, model=reasoning_model()
+    )

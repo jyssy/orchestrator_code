@@ -10,6 +10,12 @@ from dotenv import load_dotenv
 
 from orchestrator.egress_guard import ModelEgressBlocked, RemoteTransmissionDenied
 from orchestrator.model_gateway import ProviderFailure, completion
+from orchestrator.model_roles import (
+    coding_model,
+    general_model,
+    local_coding_model,
+    reasoning_model,
+)
 from orchestrator.results import ComponentResult, ResultStatus, diagnostic
 
 load_dotenv(Path(__file__).parent.parent / ".env", override=False)  # shell vars win
@@ -18,13 +24,7 @@ _BASE_URL = os.getenv("REALMS_BASE_URL", "https://reallms.rescloud.iu.edu/direct
 _API_KEY = os.getenv("REALMS_API_KEY", "")
 _OFFLINE = os.getenv("OFFLINE_MODE", "false").lower() == "true"
 
-# Model assignments
-_CODING_MODEL = "Qwen3-Coder-Next"
-_GENERAL_MODEL = "gemma-4-31B-it"   # 262K context — ideal for large file reads
-_REASONING_MODEL = "gpt-oss-120b"   # heaviest tasks, judge passes
-
 _OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-_LOCAL_CODING = os.getenv("OLLAMA_CODING_MODEL", "qwen2.5-coder:7b")
 
 
 def _realms(model: str, messages: list[dict], **kwargs) -> str:
@@ -77,22 +77,26 @@ def _local(model: str, messages: list[dict]) -> str:
         ) from None
 
 
-def _provider_result(component: str, exc: ProviderFailure) -> ComponentResult[str]:
+def _provider_result(
+    component: str, exc: ProviderFailure, *, model: str
+) -> ComponentResult[str]:
     return ComponentResult(
         component,
         exc.status,
         code=exc.code,
         message=exc.safe_message,
         attempts=exc.attempts,
+        model=model,
     )
 
 
-def _internal_result(component: str) -> ComponentResult[str]:
+def _internal_result(component: str, *, model: str) -> ComponentResult[str]:
     return ComponentResult(
         component,
         ResultStatus.INTERNAL_FAILURE,
         code="model_component_internal_failure",
         message="The model component failed unexpectedly.",
+        model=model,
     )
 
 
@@ -111,21 +115,26 @@ def code(prompt: str, context: str = "") -> str:
 
 def code_result(prompt: str, context: str = "") -> ComponentResult[str]:
     """Coding specialist with an explicit remote/local fallback result."""
+    remote_model = coding_model()
+    fallback_model = local_coding_model()
     messages = []
     if context:
         messages.append({"role": "system", "content": f"Relevant context:\n{context}"})
     messages.append({"role": "user", "content": prompt})
     try:
         return ComponentResult(
-            "specialist", ResultStatus.SUCCESS, _realms(_CODING_MODEL, messages)
+            "specialist",
+            ResultStatus.SUCCESS,
+            _realms(remote_model, messages),
+            model=remote_model,
         )
     except RemoteTransmissionDenied:
         # Only an explicit local-only policy triggers fallback. Scanner and
         # secret failures use a different error and remain fail-closed.
         try:
-            value = _local(_LOCAL_CODING, messages)
+            value = _local(fallback_model, messages)
         except ProviderFailure as exc:
-            return _provider_result("specialist", exc)
+            return _provider_result("specialist", exc, model=fallback_model)
         return ComponentResult(
             "specialist",
             ResultStatus.DEGRADED_SUCCESS,
@@ -139,14 +148,19 @@ def code_result(prompt: str, context: str = "") -> ComponentResult[str]:
                     "Repository policy required the local coding model.",
                 ),
             ),
+            model=fallback_model,
         )
     except ProviderFailure as remote_failure:
         if remote_failure.status is not ResultStatus.UNAVAILABLE_DEPENDENCY:
-            return _provider_result("specialist", remote_failure)
+            return _provider_result(
+                "specialist", remote_failure, model=remote_model
+            )
         try:
-            value = _local(_LOCAL_CODING, messages)
+            value = _local(fallback_model, messages)
         except ProviderFailure as local_failure:
-            return _provider_result("specialist", local_failure)
+            return _provider_result(
+                "specialist", local_failure, model=fallback_model
+            )
         return ComponentResult(
             "specialist",
             ResultStatus.DEGRADED_SUCCESS,
@@ -161,11 +175,12 @@ def code_result(prompt: str, context: str = "") -> ComponentResult[str]:
                     "The remote coding model was unavailable; the local model was used.",
                 ),
             ),
+            model=fallback_model,
         )
     except ModelEgressBlocked:
         raise
     except Exception:  # noqa: BLE001 - public status must not expose provider details
-        return _internal_result("specialist")
+        return _internal_result("specialist", model=remote_model)
 
 
 def ops(prompt: str, context: str = "") -> str:
@@ -174,18 +189,24 @@ def ops(prompt: str, context: str = "") -> str:
     if context:
         messages.append({"role": "system", "content": f"Relevant context:\n{context}"})
     messages.append({"role": "user", "content": prompt})
-    return _realms(_GENERAL_MODEL, messages)
+    return _realms(general_model(), messages)
 
 
 def ops_result(prompt: str, context: str = "") -> ComponentResult[str]:
+    model = general_model()
     try:
-        return ComponentResult("specialist", ResultStatus.SUCCESS, ops(prompt, context))
+        return ComponentResult(
+            "specialist",
+            ResultStatus.SUCCESS,
+            ops(prompt, context),
+            model=model,
+        )
     except ModelEgressBlocked:
         raise
     except ProviderFailure as exc:
-        return _provider_result("specialist", exc)
+        return _provider_result("specialist", exc, model=model)
     except Exception:  # noqa: BLE001 - public status must not expose provider details
-        return _internal_result("specialist")
+        return _internal_result("specialist", model=model)
 
 
 def reason(prompt: str, context: str = "") -> str:
@@ -194,20 +215,24 @@ def reason(prompt: str, context: str = "") -> str:
     if context:
         messages.append({"role": "system", "content": f"Relevant context:\n{context}"})
     messages.append({"role": "user", "content": prompt})
-    return _realms(_REASONING_MODEL, messages)
+    return _realms(reasoning_model(), messages)
 
 
 def reason_result(prompt: str, context: str = "") -> ComponentResult[str]:
+    model = reasoning_model()
     try:
         return ComponentResult(
-            "specialist", ResultStatus.SUCCESS, reason(prompt, context)
+            "specialist",
+            ResultStatus.SUCCESS,
+            reason(prompt, context),
+            model=model,
         )
     except ModelEgressBlocked:
         raise
     except ProviderFailure as exc:
-        return _provider_result("specialist", exc)
+        return _provider_result("specialist", exc, model=model)
     except Exception:  # noqa: BLE001 - public status must not expose provider details
-        return _internal_result("specialist")
+        return _internal_result("specialist", model=model)
 
 
 def summarize(prompt: str, context: str = "") -> str:

@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from orchestrator.egress_guard import ModelEgressBlocked, egress_scope, guard_text
 from orchestrator.model_gateway import ProviderFailure, embedding, rerank
+from orchestrator.model_roles import embedding_model, reranker_model
 from orchestrator.results import ComponentResult, ResultStatus, diagnostic
 from orchestrator.security import (
     INDEXABLE_EXTENSIONS,
@@ -86,9 +87,9 @@ class IndexReport:
 
 
 def _embed(texts: list[str]) -> list[list[float]]:
-    """Embed safe texts via REALMS Qwen3-Embedding-8B."""
+    """Embed safe texts with the configured REALMS embedding model."""
     response = embedding(
-        model="openai/Qwen3-Embedding-8B",
+        model=f"openai/{embedding_model()}",
         texts=texts,
         api_base=_BASE_URL,
         api_key=_API_KEY,
@@ -98,11 +99,12 @@ def _embed(texts: list[str]) -> list[list[float]]:
 
 def _rerank_result(query: str, documents: list[str]) -> ComponentResult[list[int]]:
     """Return ranked indices and make any stable-order fallback visible."""
+    model = reranker_model()
     try:
         response = rerank(
             base_url=_BASE_URL,
             api_key=_API_KEY,
-            model="Qwen3-Reranker-8B",
+            model=model,
             query=query,
             documents=documents,
             top_n=_FINAL_K,
@@ -124,7 +126,9 @@ def _rerank_result(query: str, documents: list[str]) -> ComponentResult[list[int
             for index in indices
         ) or len(indices) != len(set(indices)):
             raise ValueError("reranker indices are invalid")
-        return ComponentResult("reranker", ResultStatus.SUCCESS, indices)
+        return ComponentResult(
+            "reranker", ResultStatus.SUCCESS, indices, model=model
+        )
     except ModelEgressBlocked:
         raise
     except ProviderFailure as exc:
@@ -162,6 +166,7 @@ def _rerank_result(query: str, documents: list[str]) -> ComponentResult[list[int
             message=message,
             attempts=exc.attempts,
             warnings=(diagnostic("reranker", code, message),),
+            model=model,
         )
     except (KeyError, TypeError, ValueError):
         fallback = list(range(min(_FINAL_K, len(documents))))
@@ -178,6 +183,7 @@ def _rerank_result(query: str, documents: list[str]) -> ComponentResult[list[int
                     "Reranking returned malformed data; stable retrieval order was used.",
                 ),
             ),
+            model=model,
         )
 
 
@@ -430,6 +436,10 @@ def retrieve_context_result(
             message=rerank_result.message,
             attempts=rerank_result.attempts,
             warnings=rerank_result.warnings,
+            model=(
+                f"{embedding_model()} + "
+                f"{rerank_result.model or reranker_model()}"
+            ),
         )
     except ModelEgressBlocked:
         raise
@@ -440,6 +450,7 @@ def retrieve_context_result(
             code=exc.code,
             message=exc.safe_message,
             attempts=exc.attempts,
+            model=f"{embedding_model()} + {reranker_model()}",
         )
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, IndexError):
         return ComponentResult(

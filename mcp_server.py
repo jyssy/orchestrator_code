@@ -17,6 +17,7 @@ from fastmcp import FastMCP
 
 from orchestrator.approval import validate_approval
 from orchestrator.context import capture_repository_snapshot, reload_policy_identity
+from orchestrator.model_roles import model_role_label, reasoning_model
 from orchestrator.models import ApprovalRecord, StructuredPlan
 from orchestrator.pipeline import plan, plan_structured, run
 from orchestrator.rag import index_directory, scan_directory
@@ -32,6 +33,14 @@ use plan_task_structured and validate_plan_approval with an external human appro
 record; the CLI owns approval creation and write-capable executor launch."""
 
 mcp = FastMCP("orchestrator", instructions=_INSTRUCTIONS)
+
+
+def _attributed_answer(result: dict, *, use_judge: bool) -> str:
+    roles = result.get("model_roles", {})
+    labels = [model_role_label("Reviewer", roles.get("reviewer"))]
+    if use_judge:
+        labels.append(model_role_label("Judge", roles.get("judge")))
+    return f"{' | '.join(labels)}\n\n{result['final']}"
 
 
 @mcp.tool(
@@ -51,7 +60,7 @@ def ask_orchestrator(
     Pass repo_root so effective AGENTS.md policy and repo-scoped RAG are loaded.
     Optionally pass one or more safe files as additional context.
     Set use_judge=false for a faster single-pass response.
-    Returns the final answer after any requested judge revision.
+    Returns the final answer with reviewer and judge model attribution.
     """
     result = run(
         prompt,
@@ -66,7 +75,7 @@ def ask_orchestrator(
             "message": "The orchestration request did not produce an answer."
         }
         raise RuntimeError(error["message"])
-    return result["final"]
+    return _attributed_answer(result, use_judge=use_judge)
 
 
 @mcp.tool(
@@ -109,13 +118,14 @@ def plan_task(
     human gates, and risks. Pass repo_root to load effective AGENTS.md guidance
     and repository state. Present the result for approval before acting.
     """
-    return plan(
+    proposal = plan(
         prompt,
         context_path=context_path or None,
         context_paths=context_paths,
         repo_root=repo_root or None,
         effective_constraints=effective_constraints,
     )
+    return f"{model_role_label('Reviewer', reasoning_model())}\n\n{proposal}"
 
 
 @mcp.tool(

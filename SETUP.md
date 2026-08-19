@@ -117,8 +117,8 @@ classification and boundary model.
 
 Expected output:
 - `Task type: coding`
-- Draft answer from Qwen3-Coder-Next
-- Revised answer (if judge found issues) from gpt-oss-120b
+- `Reviewer (Qwen3-Coder-Next)` on the draft or answer
+- `Judge (gpt-oss-120b)` on the reviewed or revised answer
 
 **Build the RAG index once**, to confirm indexing works end to end:
 ```sh
@@ -146,9 +146,9 @@ multi-repo permissions model, see [`DIRECTIONS.md`](DIRECTIONS.md).
 The MCP server exposes seven tools that Codex, Claude Code, Zed, and other MCP
 clients can call:
 
-- `ask_orchestrator` — routes a prompt through the full pipeline and returns the answer; pass `use_judge=false` for a faster single-pass response
-- `ask_orchestrator_structured` — runs the same pipeline and returns the answer plus sanitized status, component, warning, and error metadata
-- `plan_task` — generates a scoped plan (scope, changes, checks, human gates, risks) without executing anything
+- `ask_orchestrator` — routes a prompt through the full pipeline and returns the answer with reviewer/judge model attribution; pass `use_judge=false` for a faster single-pass response
+- `ask_orchestrator_structured` — runs the same pipeline and returns the answer plus model attribution and sanitized status, component, warning, and error metadata
+- `plan_task` — generates a reviewer/model-attributed scoped plan (scope, changes, checks, human gates, risks) without executing anything
 - `plan_task_structured` — returns a versioned plan record without writing it
 - `validate_plan_approval` — checks supplied records against current repository and policy state
 - `audit_index` — reports what is safe to index without making model calls
@@ -165,9 +165,10 @@ approval to structured records and current repository and policy state.
 human review, and later call `ask_orchestrator` with the same task, `repo_root`,
 and `effective_constraints`. That sequence remains advisory: MCP does not create
 or consume the canonical approval record and does not launch the executor.
-`ask_orchestrator` still returns the final answer as plain text for existing
-clients. Call `ask_orchestrator_structured` when the client must distinguish a
-normal result from degraded operation or a sanitized failure.
+`ask_orchestrator` still returns text, now prefixed with `Reviewer (model)` and,
+when enabled, `Judge (model)`. Call `ask_orchestrator_structured` when the client
+must consume model attribution as fields or distinguish a normal result from
+degraded operation or a sanitized failure.
 
 ### The general registration pattern
 
@@ -345,6 +346,14 @@ Keep at most **one** 7B model loaded at a time. REALMS handles the heavy lifting
 | RAG embeddings | Qwen3-Embedding-8B | REALMS |
 | Quick classification | qwen2.5:1.5b | Local Ollama |
 | Offline coding fallback | qwen2.5-coder:7b | Local Ollama |
+
+These are defaults, not display-only hard-coded labels. Override the REALMS
+assignments with `REALMS_CODING_MODEL`, `REALMS_GENERAL_MODEL`,
+`REALMS_REASONING_MODEL`, `REALMS_EMBEDDING_MODEL`, or
+`REALMS_RERANKER_MODEL`. Orchestration output reports the configured model that
+was actually selected, including the local coding fallback when it is used.
+Existing CLI and MCP commands do not change; only their displayed/returned model
+attribution and the structured response metadata are additive.
 
 ---
 

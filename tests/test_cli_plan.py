@@ -54,6 +54,7 @@ def test_plan_command_prints_plan_without_execution_or_approval(tmp_path, monkey
 
     assert result.exit_code == 0
     assert "Plan (no changes made)" in result.stdout
+    assert "Reviewer (gpt-oss-120b)" in result.stdout
     assert "Read-only planning" in result.stdout
     assert received == {
         "prompt": "Add request validation",

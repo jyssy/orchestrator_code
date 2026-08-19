@@ -8,13 +8,12 @@ from typing import Literal
 
 from orchestrator.egress_guard import ModelEgressBlocked
 from orchestrator.model_gateway import ProviderFailure, ollama_generate
+from orchestrator.model_roles import router_model
 from orchestrator.results import ComponentResult, ResultStatus, diagnostic
 
 TaskType = Literal["coding", "ops", "general", "search"]
 
 _OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-_ROUTER_MODEL = os.getenv("OLLAMA_ROUTER_MODEL", "qwen2.5:1.5b")
-
 _SYSTEM_PROMPT = """You are a task classifier. Given a user prompt, output exactly one word:
 - coding    (writing, debugging, refactoring, or reviewing code)
 - ops       (infrastructure, ansible, terraform, CI/CD, server administration)
@@ -42,10 +41,11 @@ def _keyword_fallback(prompt: str) -> TaskType:
 
 def classify_result(prompt: str) -> ComponentResult[TaskType]:
     """Return task classification with visible local-router degradation."""
+    model = router_model()
     try:
         response = ollama_generate(
             base_url=_OLLAMA_BASE,
-            model=_ROUTER_MODEL,
+            model=model,
             system=_SYSTEM_PROMPT,
             prompt=prompt,
             options={"temperature": 0, "num_predict": 5},
@@ -53,7 +53,9 @@ def classify_result(prompt: str) -> ComponentResult[TaskType]:
         )
         raw = response.json().get("response", "").strip().lower().split()[0]
         if raw in ("coding", "ops", "search", "general"):
-            return ComponentResult("router", ResultStatus.SUCCESS, raw)
+            return ComponentResult(
+                "router", ResultStatus.SUCCESS, raw, model=model
+            )
         return ComponentResult(
             "router",
             ResultStatus.DEGRADED_SUCCESS,

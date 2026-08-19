@@ -46,6 +46,7 @@ class ComponentResult(Generic[T]):
     message: str = "Completed successfully."
     attempts: int = 1
     warnings: tuple[Diagnostic, ...] = field(default_factory=tuple)
+    model: str | None = None
 
     @property
     def usable(self) -> bool:
@@ -54,9 +55,10 @@ class ComponentResult(Generic[T]):
             ResultStatus.DEGRADED_SUCCESS,
         }
 
-    def public_summary(self) -> dict[str, str | int]:
+    def public_summary(self) -> dict[str, str | int | None]:
         return {
             "component": self.component,
+            "model": self.model,
             "status": self.status.value,
             "code": self.code,
             "message": self.message,

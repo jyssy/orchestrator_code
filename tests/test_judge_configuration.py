@@ -89,6 +89,8 @@ def test_no_judge_cli_option_disables_judge_for_that_request(monkeypatch):
 
     assert result.exit_code == 0
     assert received["judge_enabled"] is False
+    assert "Reviewer (Qwen3-Coder-Next)" in result.stdout
+    assert "Judge (" not in result.stdout
 
 
 def test_mcp_ask_forwards_judge_choice(monkeypatch):
@@ -107,7 +109,10 @@ def test_mcp_ask_forwards_judge_choice(monkeypatch):
         received["repo_root"] = repo_root
         received["judge_enabled"] = judge_enabled
         received["effective_constraints"] = effective_constraints
-        return {"final": "answer"}
+        return {
+            "final": "answer",
+            "model_roles": {"reviewer": "Qwen3-Coder-Next", "judge": None},
+        }
 
     monkeypatch.setattr(mcp_server, "run", fake_run)
 
@@ -117,7 +122,7 @@ def test_mcp_ask_forwards_judge_choice(monkeypatch):
         use_judge=False,
     )
 
-    assert result == "answer"
+    assert result == "Reviewer (Qwen3-Coder-Next)\n\nanswer"
     assert received == {
         "context_path": "example.py",
         "context_paths": None,
@@ -156,3 +161,20 @@ def test_mcp_structured_plan_forwards_constraints_and_allowed_paths(monkeypatch)
         "context_path": None,
         "context_paths": None,
     }
+
+
+def test_mcp_plan_identifies_the_reviewer_model(monkeypatch):
+    monkeypatch.setattr(mcp_server, "plan", lambda *args, **kwargs: "plan text")
+
+    assert mcp_server.plan_task("prompt") == (
+        "Reviewer (gpt-oss-120b)\n\nplan text"
+    )
+
+
+def test_mcp_plan_label_tracks_configured_reasoning_model(monkeypatch):
+    monkeypatch.setenv("REALMS_REASONING_MODEL", "replacement-reasoner")
+    monkeypatch.setattr(mcp_server, "plan", lambda *args, **kwargs: "plan text")
+
+    assert mcp_server.plan_task("prompt") == (
+        "Reviewer (replacement-reasoner)\n\nplan text"
+    )

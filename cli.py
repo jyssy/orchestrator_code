@@ -36,9 +36,16 @@ from orchestrator.context import (
     discover_repo_roots,
     reload_policy_identity,
 )
+from orchestrator.model_roles import (
+    embedding_model,
+    model_role_label,
+    reasoning_model,
+    reviewer_model,
+    router_model,
+)
 from orchestrator.security import (
-    DataClassification,
     MODEL_EGRESS_POLICY_FILENAME,
+    DataClassification,
     ModelEgressPolicyError,
     load_model_egress_policy,
 )
@@ -183,7 +190,8 @@ def plan_command(
         raise typer.BadParameter(str(exc)) from exc
 
     console.print(f"[bold cyan]Repository:[/bold cyan] {target}")
-    console.print("[dim]Generating a read-only plan...[/dim]")
+    plan_reviewer = model_role_label("Reviewer", reasoning_model())
+    console.print(f"[dim]{plan_reviewer}: generating a read-only plan...[/dim]")
     if allowed_paths:
         structured = run_structured_plan(
             prompt,
@@ -210,7 +218,7 @@ def plan_command(
     console.print(
         Panel(
             Markdown(proposal),
-            title="[bold yellow]Plan (no changes made)[/bold yellow]",
+            title=f"[bold yellow]{plan_reviewer} — Plan (no changes made)[/bold yellow]",
             border_style="yellow",
         )
     )
@@ -423,20 +431,28 @@ def ask(
 
     # Compatibility plan-first mode for an advisory response.
     if plan_only or os.getenv("PLAN_FIRST", "false").lower() == "true":
-        console.print("[dim]Generating plan...[/dim]")
+        plan_reviewer = model_role_label("Reviewer", reasoning_model())
+        console.print(f"[dim]{plan_reviewer}: generating a plan...[/dim]")
         proposal = run_plan(
             prompt,
             context_path=ctx_path,
             repo_root=str(repo_root) if repo_root else None,
         )
-        console.print(Panel(Markdown(proposal), title="[bold yellow]Plan (no changes made)[/bold yellow]", border_style="yellow"))
+        console.print(
+            Panel(
+                Markdown(proposal),
+                title=f"[bold yellow]{plan_reviewer} — Plan (no changes made)[/bold yellow]",
+                border_style="yellow",
+            )
+        )
         approved = typer.confirm("\nProceed to the advisory response?", default=False)
         if not approved:
             console.print("[dim]Aborted — no changes made.[/dim]")
             raise typer.Exit()
         console.print("[dim]Confirmed. Generating the advisory response...[/dim]")
 
-    console.print("[dim]Classifying prompt...[/dim]")
+    router_label = model_role_label("Router", router_model())
+    console.print(f"[dim]{router_label}: classifying prompt...[/dim]")
     result = run(
         prompt,
         context_path=ctx_path,
@@ -467,11 +483,40 @@ def ask(
         f"{'yes' if result.get('retrieval_used', result['context_used']) else 'no'}"
     )
 
+    roles = result.get("model_roles", {})
+    reviewer_label = model_role_label(
+        "Reviewer", roles.get("reviewer") or reviewer_model(result["task_type"])
+    )
+    judge_label = model_role_label(
+        "Judge", roles.get("judge") or reasoning_model()
+    )
+
     if result["draft"] != result["final"]:
-        console.print(Panel(Markdown(result["draft"]), title="Draft", border_style="yellow"))
-        console.print(Panel(Markdown(result["final"]), title="Revised (judge pass)", border_style="green"))
+        console.print(
+            Panel(
+                Markdown(result["draft"]),
+                title=f"{reviewer_label} — Draft",
+                border_style="yellow",
+            )
+        )
+        console.print(
+            Panel(
+                Markdown(result["final"]),
+                title=f"{judge_label} — Revised",
+                border_style="green",
+            )
+        )
     else:
-        console.print(Panel(Markdown(result["final"]), title="Answer", border_style="green"))
+        attribution = (
+            reviewer_label if no_judge else f"{reviewer_label} | {judge_label}"
+        )
+        console.print(
+            Panel(
+                Markdown(result["final"]),
+                title=f"{attribution} — Answer",
+                border_style="green",
+            )
+        )
 
 
 @app.command()
@@ -501,7 +546,8 @@ def index(
     console.print(f"[dim]Scanning {source} before transmission...[/dim]")
 
     def show_progress(done: int, total: int) -> None:
-        console.print(f"[dim]Embedded {done}/{total} chunks[/dim]")
+        embedding_label = model_role_label("Embedding", embedding_model())
+        console.print(f"[dim]{embedding_label}: {done}/{total} chunks[/dim]")
 
     if refresh:
         report = refresh_repositories(str(source), progress=show_progress)

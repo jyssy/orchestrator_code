@@ -345,8 +345,10 @@ Delivered. The shared contract is implemented in `orchestrator/results.py`,
 provider failure classification and bounded retries live in
 `orchestrator/model_gateway.py`, and sanitized status propagation now covers
 routing, retrieval, reranking, specialist calls, judging, the pipeline, CLI, and
-MCP. The original text-returning `ask_orchestrator` contract remains compatible;
-`ask_orchestrator_structured` exposes the diagnostic envelope to new clients.
+MCP. The text-returning `ask_orchestrator` command and arguments remain stable;
+its returned text now begins with requested reviewer/judge model attribution.
+`ask_orchestrator_structured` exposes the diagnostic envelope and model metadata
+to new clients.
 
 **Problem**
 

@@ -67,10 +67,10 @@ mcp_server.py / FastMCP
   |                           +-- select specialist model
   |                           +-- generate draft
   |                           +-- critique/revise draft
-  |                           +-- plain final text for legacy clients
+  |                           +-- reviewer/judge-attributed final text
   |
   +-- ask_orchestrator_structured
-  |                        -> same pipeline + sanitized status envelope
+  |                        -> same pipeline + model metadata/status envelope
   |
   +-- audit_index ---------> safety scan only
   |
@@ -154,8 +154,9 @@ Inputs:
 - `context_path`: one optional safe file.
 - `context_paths`: an optional list of safe files.
 
-The tool calls `pipeline.plan()` and returns a structured proposal. It is marked
-read-only in its MCP annotations.
+The tool calls `pipeline.plan()` and returns a structured proposal prefixed with
+`Reviewer (configured reasoning model)`. It is marked read-only in its MCP
+annotations.
 
 #### `ask_orchestrator`
 
@@ -163,15 +164,17 @@ Inputs are the same as `plan_task`, plus:
 
 - `use_judge`: whether to run critique and possible revision; defaults to `true`.
 
-The tool calls `pipeline.run()` and returns only the pipeline's final answer. It
-does not return the initial draft, classification, or other internal metadata.
-This text-returning behavior is preserved for existing MCP clients.
+The tool calls `pipeline.run()` and returns the pipeline's final answer prefixed
+with `Reviewer (model)` and, when enabled, `Judge (model)`. It does not return
+the initial draft, classification, or other internal metadata as fields; clients
+that parse the formerly unprefixed text must allow for the attribution line.
 
 #### `ask_orchestrator_structured`
 
 Inputs are identical to `ask_orchestrator`. It calls the same pipeline and
-returns the final answer together with sanitized overall status, per-component
-status, warnings, retry-attempt counts, and a safe error code when applicable.
+returns the final answer together with model roles, sanitized overall status,
+per-component model/status, warnings, retry-attempt counts, and a safe error code
+when applicable.
 The diagnostic envelope contains no prompts, source chunks, credentials,
 provider bodies, scanner output, or unrestricted exception text.
 
@@ -335,8 +338,8 @@ MCP request
   -> _build_context()
   -> fixed structured-planning instruction
   -> specialists.reason()
-  -> REALMS gpt-oss-120b
-  -> plan text returned through MCP
+  -> configured REALMS reasoning model (default gpt-oss-120b)
+  -> Reviewer (model) + plan text returned through MCP
 ```
 
 The fixed planning instruction asks the model to produce:
@@ -351,9 +354,9 @@ The fixed planning instruction asks the model to produce:
 - Risks and assumptions.
 - Required final handoff details.
 
-Planning always uses the reasoning model. It does not use task classification,
-specialist routing, or the judge pass. The returned plan is a proposal only; it
-does not authorize implementation.
+Planning always uses the configured reasoning model. It does not use task
+classification, specialist routing, or the judge pass. The returned plan is a
+proposal only; it does not authorize implementation.
 
 ## The Full Answer Flow
 
@@ -369,7 +372,7 @@ MCP request
        4. produce a draft or an explicit failure
        5. critique_and_revise_result()
        6. aggregate component status and sanitized diagnostics
-  -> plain final text or structured result returned through MCP
+  -> model-attributed final text or structured result returned through MCP
 ```
 
 The complete internal result contains:
@@ -381,19 +384,22 @@ The complete internal result contains:
     "context_used": True | False,
     "retrieval_used": True | False,
     "repo_root": "/resolved/repository/or/None",
+    "model_roles": {"reviewer": "...", "judge": "..."},
     "draft": "initial specialist answer",
     "final": "original or judge-revised answer",
     "warnings": [{"component": "...", "code": "...", "message": "..."}],
     "error": None | {"component": "...", "code": "...", "message": "..."},
-    "components": [{"component": "...", "status": "...", "attempts": 1}],
+    "components": [
+        {"component": "...", "model": "...", "status": "...", "attempts": 1}
+    ],
 }
 ```
 
-The compatibility MCP wrapper exposes only `final`. The structured MCP tool
-exposes the complete sanitized result, and the direct CLI prints overall status,
-safe warnings, task type, actual retrieval use, and draft/revision differences.
-Answer fields remain the model's verbatim output; only diagnostics are
-restricted to safe codes and fixed messages.
+The text MCP wrapper exposes an attribution line plus `final`. The structured
+MCP tool exposes the complete sanitized result, and the direct CLI prints
+overall status, safe warnings, task type, actual retrieval use, and model-labelled
+draft/revision differences. Answer fields remain the model's verbatim output;
+only diagnostics are restricted to safe codes and fixed messages.
 
 ## Classification and Specialist Routing
 
@@ -420,7 +426,9 @@ the earlier group rather than its main intent.
 
 ### Model assignments
 
-`orchestrator/specialists.py` maps categories to these models:
+`orchestrator/specialists.py` maps categories to these default models. The
+environment variables in Configuration and Initialization override them per
+call, and returned labels use the selected or fallback model:
 
 | Use | Model and location |
 | --- | --- |
@@ -454,10 +462,10 @@ revision stage.
 
 1. It receives the original request and the specialist draft.
 2. It also receives the effective policy and repository context.
-3. It asks `gpt-oss-120b` to identify factual errors, missing edge cases,
+3. It asks the configured reasoning model (default `gpt-oss-120b`) to identify factual errors, missing edge cases,
    security issues, and unnecessary complexity.
 4. If the critique begins with `LGTM`, the draft becomes the final answer.
-5. Otherwise, a second `gpt-oss-120b` call receives the request, draft, critique,
+5. Otherwise, a second call to that model receives the request, draft, critique,
    and context and produces a corrected answer.
 
 The environment variable `JUDGE_ENABLED` controls the default for direct
@@ -746,15 +754,16 @@ which sections are present or how a model should cite them.
 ### MCP contract
 
 FastMCP derives each tool schema from the Python signature and docstring. The
-legacy `ask_orchestrator` contract still consists of primitive arguments and a
-returned final-answer string. The additive `ask_orchestrator_structured` tool
-uses the same arguments and returns the pipeline's JSON-compatible diagnostic
-envelope. There is no repository-defined protocol-buffer, REST, or domain-event
-schema.
+`ask_orchestrator` contract still consists of primitive arguments and a returned
+string, now with a model-attribution line before the final answer. The additive
+`ask_orchestrator_structured` tool uses the same arguments and returns the
+pipeline's JSON-compatible diagnostic envelope with model metadata. There is no
+repository-defined protocol-buffer, REST, or domain-event schema.
 
-This split preserves existing clients while allowing new clients to distinguish
-warnings, component status, retries, retrieval use, and sanitized failures from
-ordinary answer prose.
+The command and argument surface is unchanged. Clients that assumed the string
+began directly with answer prose must accept the new attribution line;
+structured clients can distinguish model roles, warnings, component status,
+retries, retrieval use, and sanitized failures from ordinary answer prose.
 
 ### Context contract
 
@@ -813,6 +822,11 @@ Configuration is environment-driven:
 | --- | --- | --- |
 | `REALMS_BASE_URL` | specialists and RAG | OpenAI-compatible completion, embedding, and reranking endpoint. |
 | `REALMS_API_KEY` | specialists and RAG | Credential for REALMS calls. |
+| `REALMS_CODING_MODEL` | specialists | Coding reviewer model; defaults to `Qwen3-Coder-Next`. |
+| `REALMS_GENERAL_MODEL` | specialists | Ops and search reviewer model; defaults to `gemma-4-31B-it`. |
+| `REALMS_REASONING_MODEL` | specialists and judge | General reviewer, planner, and judge model; defaults to `gpt-oss-120b`. |
+| `REALMS_EMBEDDING_MODEL` | RAG | Embedding model; defaults to `Qwen3-Embedding-8B`. |
+| `REALMS_RERANKER_MODEL` | RAG | Reranking model; defaults to `Qwen3-Reranker-8B`. |
 | `OFFLINE_MODE` | specialists | Prevents REALMS completion calls. |
 | `OLLAMA_BASE_URL` | router and specialists | Local Ollama service URL. |
 | `OLLAMA_ROUTER_MODEL` | router | Local classification model. |
@@ -826,11 +840,12 @@ Configuration is environment-driven:
 | `PLAN_FIRST` | CLI | Enables compatibility plan-and-confirm behavior for `ask`. |
 | `ORCHESTRATOR_STATE_DIR` | approval workflow | User-local structured plan and approval record storage. |
 
-The `.env` file is loaded without overriding shell variables, so an exported
-value wins. Most settings become module-level constants at import time. Changing
-those environment variables after import will not reconfigure the router,
-specialists, or RAG module. `JUDGE_ENABLED` is a notable exception because it is
-read when `critique_and_revise()` is called.
+The `.env` file is loaded at process startup without overriding shell variables,
+so an exported value wins. Model assignments and `JUDGE_ENABLED` are read from
+the process environment per call so attribution tracks the selected
+configuration. Restart a long-running CLI/MCP process after editing `.env`;
+other settings generally become module-level constants at import time and also
+require a restart after a change.
 
 There is no centralized configuration object or startup validation pass. A
 missing REALMS credential is normally discovered when a completion is attempted.
