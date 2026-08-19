@@ -177,13 +177,19 @@ real cwd. There are two ways to invoke the CLI, and they differ here:
 #    and running it from orchestrator_code means cwd is orchestrator_code,
 #    never your target repo — so --repo-root is effectively always required.
 cd /path/to/orchestrator_code
-uv run orchestrate plan "..." --repo-root /path/to/target-repo
+uv run orchestrate plan "..." --repo-root /path/to/target-repo --allow 'src/**'
 
 # 2. The absolute venv executable — works from any directory, including
 #    the target repo itself, so cwd-based inference works as expected.
 cd /path/to/target-repo
-/path/to/orchestrator_code/.venv/bin/orchestrate plan "..."   # no --repo-root needed
+/path/to/orchestrator_code/.venv/bin/orchestrate plan "..." --allow 'src/**'   # no --repo-root needed
 ```
+
+Note `--allow` in both: without it, `plan` only prints a read-only Markdown
+proposal and creates no structured record at all — `approve --latest`
+afterward will correctly report "No plan record found," because there's
+nothing to find. `--allow` is what makes `plan` write the record that
+`approve`/`execute` need.
 
 The examples below define a short shell variable only to keep the commands
 readable:
