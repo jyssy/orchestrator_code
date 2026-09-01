@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -12,6 +13,39 @@ from orchestrator.results import ComponentResult, ResultStatus
 
 def _messages():
     return [{"role": "user", "content": "ordinary request"}]
+
+
+def _completion_response(**message_fields):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(**message_fields))]
+    )
+
+
+def test_response_text_prefers_standard_content():
+    response = _completion_response(
+        content="final answer",
+        reasoning_content="provider reasoning",
+    )
+
+    assert specialists._response_text(response) == "final answer"
+
+
+def test_response_text_supports_realms_reasoning_content_fallback():
+    response = _completion_response(
+        content=None,
+        reasoning_content="Qwen answer",
+    )
+
+    assert specialists._response_text(response) == "Qwen answer"
+
+
+def test_response_text_rejects_empty_provider_response():
+    response = _completion_response(content=None, reasoning_content=None)
+
+    with pytest.raises(ProviderFailure) as captured:
+        specialists._response_text(response)
+
+    assert captured.value.code == "provider_empty_response"
 
 
 def test_configured_coding_model_is_used_and_reported(monkeypatch):

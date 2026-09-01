@@ -27,6 +27,36 @@ _OFFLINE = os.getenv("OFFLINE_MODE", "false").lower() == "true"
 _OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 
+def _response_text(response) -> str:
+    """Extract assistant text from OpenAI-compatible provider responses."""
+    try:
+        message = response.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        raise ProviderFailure(
+            ResultStatus.INTERNAL_FAILURE,
+            "provider_malformed_response",
+            "The model provider returned a malformed response.",
+        ) from None
+
+    candidates = [
+        getattr(message, "content", None),
+        getattr(message, "reasoning_content", None),
+    ]
+    provider_fields = getattr(message, "provider_specific_fields", None)
+    if isinstance(provider_fields, dict):
+        candidates.append(provider_fields.get("reasoning"))
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+
+    raise ProviderFailure(
+        ResultStatus.INTERNAL_FAILURE,
+        "provider_empty_response",
+        "The model provider returned an empty response.",
+    )
+
+
 def _realms(model: str, messages: list[dict], **kwargs) -> str:
     """Call a REALMS model. Raises if offline mode is set or key is missing."""
     if _OFFLINE:
@@ -49,14 +79,7 @@ def _realms(model: str, messages: list[dict], **kwargs) -> str:
         remote=True,
         **kwargs,
     )
-    try:
-        return response.choices[0].message.content or ""
-    except (AttributeError, IndexError, TypeError):
-        raise ProviderFailure(
-            ResultStatus.INTERNAL_FAILURE,
-            "provider_malformed_response",
-            "The model provider returned a malformed response.",
-        ) from None
+    return _response_text(response)
 
 
 def _local(model: str, messages: list[dict]) -> str:
@@ -67,14 +90,7 @@ def _local(model: str, messages: list[dict]) -> str:
         api_base=_OLLAMA_BASE,
         remote=False,
     )
-    try:
-        return response.choices[0].message.content or ""
-    except (AttributeError, IndexError, TypeError):
-        raise ProviderFailure(
-            ResultStatus.INTERNAL_FAILURE,
-            "provider_malformed_response",
-            "The model provider returned a malformed response.",
-        ) from None
+    return _response_text(response)
 
 
 def _provider_result(
