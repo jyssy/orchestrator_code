@@ -15,63 +15,128 @@ and secret-scanning boundary, see [`SECURITY.md`](SECURITY.md).
 
 ---
 
-## Quick Start — guarded coding workflow
+## Quick Start — copy/paste guarded workflows
 
-Two executors are available. Codex is the default for both `work` and
-`execute`; call out `--executor claude` explicitly any time Claude Code should
-run instead:
+Use `plan`, `approve`, and `execute` for implementation. `--allow` grants write
+scope; `--deny` removes write scope and always wins when both match. Neither
+option limits what the executor may read inside the target repository.
 
-| Executor | Command | How it runs |
-|---|---|---|
-| **Codex** (default) | `orchestrate work "task"` | Read-only planning subprocess |
-| **Claude Code** | `orchestrate work "task" --executor claude` | Read-only planning subprocess |
+### Most common: run from inside the target repository
 
-`work` is now the compatibility planning launcher. For an implementation, use
-the enforced three-step workflow:
+This bounded-broad example lets the executor change application code and tests,
+but not infrastructure, CI, or Django migration files:
 
 ```sh
-orchestrate plan "describe the change" --repo-root /path/to/repo --allow 'src/**' --allow 'tests/**'
+cd /path/to/target-repository
 
-# Copy the exact Plan record path printed above.
+orchestrate plan "describe the change" \
+  --allow '**' \
+  --deny 'infra/**' \
+  --deny 'ansible/**' \
+  --deny 'terraform/**' \
+  --deny '.github/**' \
+  --deny '**/migrations/**'
+
+orchestrate approve --latest
+orchestrate execute --latest --print-only
+
+# Choose exactly one executor for the real run:
+orchestrate execute --latest                    # Codex (default)
+# orchestrate execute --latest --executor claude
+```
+
+Remove the migrations deny when migration files are intentionally part of the
+approved task. The approval is single-use, so do not run both executor lines.
+
+### Pick the write scope appropriate for the task
+
+```sh
+# Focused: one Django app and its tests.
+orchestrate plan "describe the change" \
+  --allow 'customers/**' \
+  --allow 'tests/customers/**'
+
+# Bounded broad: anywhere except protected operational areas.
+orchestrate plan "describe the change" \
+  --allow '**' \
+  --deny 'infra/**' \
+  --deny '.github/**' \
+  --deny '**/migrations/**'
+
+# Repository-wide: use only when all otherwise-permitted paths may be changed.
+orchestrate plan "describe the repository-wide change" --allow '**'
+```
+
+After any one of those planning commands, the remaining commands are always:
+
+```sh
+orchestrate approve --latest
+orchestrate execute --latest --print-only
+orchestrate execute --latest                    # Codex (default)
+# orchestrate execute --latest --executor claude  # choose this instead
+```
+
+### Add a sibling repository as read-only context
+
+Put `--add-dir` on `plan` only. It must name the root of another Git repository;
+the approved plan carries it through approval and execution automatically:
+
+```sh
+cd /path/to/application-repository
+
+orchestrate plan "describe the app change using infrastructure as context" \
+  --allow '**' \
+  --deny 'infra/**' \
+  --deny '.github/**' \
+  --add-dir ../access-sysops
+
+orchestrate approve --latest
+orchestrate execute --latest --print-only
+orchestrate execute --latest --executor claude
+```
+
+The executor may read `access-sysops`, but the workflow does not authorize it
+to edit that repository.
+
+### Run from anywhere with an explicit repository root
+
+Repeat `--repo-root` on all three commands when you are not inside the target
+repository:
+
+```sh
+orchestrate plan "describe the change" \
+  --repo-root /path/to/target-repository \
+  --allow '**' \
+  --deny 'infra/**' \
+  --deny '.github/**'
+
+orchestrate approve --latest --repo-root /path/to/target-repository
+orchestrate execute --latest --repo-root /path/to/target-repository --print-only
+
+# Choose exactly one executor:
+orchestrate execute --latest --repo-root /path/to/target-repository
+# orchestrate execute --latest --repo-root /path/to/target-repository --executor claude
+```
+
+### Use explicit plan and approval files when `--latest` is ambiguous
+
+```sh
+orchestrate plan "describe the change" --allow 'src/**' --allow 'tests/**'
+
+# Copy the exact path printed by plan.
 PLAN_FILE=/exact/path/printed/by/plan
 orchestrate approve "$PLAN_FILE"
 
-# Copy the exact Approval record path printed by approve.
+# Copy the exact path printed by approve.
 APPROVAL_FILE=/exact/path/printed/by/approve
 orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --print-only
-
-# Codex is the default executor; omit --executor to get it.
-orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --executor codex
-
-# Pass --executor claude explicitly to run Claude Code instead of Codex.
 orchestrate execute "$PLAN_FILE" "$APPROVAL_FILE" --executor claude
 ```
 
-Both `work` and `execute` accept `--executor claude` (short form `-e claude`)
-to select Claude Code for that one invocation. The default stays Codex unless
-you pass this flag — there is no environment variable or config file override,
-so specify it on every command where Claude should run. Add
-`--add-dir /path/to/other/directory` (repeatable) on either command to let
-that Claude Code session read files outside the target repository, e.g. a
-shared library that lives in a sibling directory; it has no effect for Codex.
-
-**Skip copying paths by hand with `--latest`.** `approve` and `execute` both
-accept `--latest` instead of an explicit file argument: it resolves to the
-most recent plan (or unconsumed approval) **for the repository you're in**,
-so a plan record made for a different repo is never picked up by accident:
-
-```sh
-orchestrate plan "describe the change" --repo-root /path/to/repo --allow 'src/**' --allow 'tests/**'
-orchestrate approve --latest --repo-root /path/to/repo
-orchestrate execute --latest --repo-root /path/to/repo --print-only
-orchestrate execute --latest --repo-root /path/to/repo --executor codex
-```
-
-`--repo-root` defaults to the current directory, same as `plan`; `--latest`
-and an explicit path argument are mutually exclusive — pass one or the other.
-
-See [`PLAN_APPROVAL_WORKFLOW.md`](PLAN_APPROVAL_WORKFLOW.md) for record formats,
-drift checks, constraints, scope validation, and limitations.
+`--deny` and `--add-dir` require a structured `plan --allow` command. Do not
+repeat either on `approve` or `execute`; they are bound into the plan. See
+[`PLAN_APPROVAL_WORKFLOW.md`](PLAN_APPROVAL_WORKFLOW.md) for record formats,
+drift checks, scope validation, and current enforcement limitations.
 
 ---
 
@@ -107,7 +172,8 @@ the table below sets all three:
 2. **Read scope** — which directories the process (or the Codex/Claude
    subprocess it launches) can see. Default is the target repo's own tree.
 3. **Write scope** — which paths inside that one repo may actually be edited.
-   Nothing outside the target repo can ever be written by these commands.
+   The guarded executor is configured to write only in the target repo; bound
+   context repos are explicitly denied writes and checked again after execution.
 4. **Model egress** — whether that repo's content is allowed to leave the
    machine at all, and to where. This is controlled per-repo by that repo's
    own `.orchestrator-policy.toml` (`deny-model` / `local-only` /
@@ -119,9 +185,9 @@ the table below sets all three:
 | Command | Target repo | Reads | Writes | Model egress |
 |---|---|---|---|---|
 | `ask` | **Required** `--repo-root`, never inferred | That repo's AGENTS.md, Git state, `--file`, and its RAG index only | Never | Yes, subject to that repo's policy |
-| `plan` | `--repo-root`, or current directory if omitted | Same as `ask` | Never edits the repo. `--allow` only records a *proposed* write scope in a plan file under `~/.orchestrator/workflow/plans/` | Yes, subject to that repo's policy |
-| `approve` | Whatever repo is bound in the plan record you pass in — or, with `--latest`, the repo from `--repo-root`/cwd, resolved to that repo's newest plan record | Re-checks that repo's current Git/policy state to confirm nothing drifted | Never | No model calls |
-| `execute` | Whatever repo is bound in the plan record — or, with `--latest`, the repo from `--repo-root`/cwd, resolved to that repo's newest unconsumed approval | The launched Codex/Claude subprocess's `cwd` is that repo, plus any `--add-dir` paths (Claude only, read-only) | Executor may edit **only** paths matching the plan's `--allow` patterns, inside that one repo; checked against the Git-visible diff *after* the process exits — this is scope validation, not an OS-level sandbox | Yes, indirectly — the executor's own `ask_orchestrator` calls are still checked against that repo's policy |
+| `plan` | `--repo-root`, or current directory if omitted | Same as `ask`; with `--allow`, repeatable `--add-dir` values bind separate read-only context repositories and query their existing RAG entries | Never edits any repo. `--allow` records proposed write scope and `--deny` removes matching paths from that scope; deny always wins | Yes, subject to every participating repo's policy |
+| `approve` | Whatever repo is bound in the plan record you pass in — or, with `--latest`, the repo from `--repo-root`/cwd, resolved to that repo's newest plan record | Re-checks the target and every bound context repo's current Git/policy state to confirm nothing drifted | Never | No model calls |
+| `execute` | Whatever repo is bound in the plan record — or, with `--latest`, the repo from `--repo-root`/cwd, resolved to that repo's newest unconsumed approval | The launched Codex/Claude subprocess works in the target repo and may inspect context repos stored by `plan --add-dir` | Executor may edit only target paths matching `--allow` and no `--deny`. Claude receives invocation-local deny rules; all executors receive post-execution validation. Context repos remain read-only and are checked after exit | Yes, indirectly; all participating repos must permit remote model use before launch |
 | `work` | `--repo-root`, or current directory if omitted | That repo, read-only (Codex `--sandbox read-only` / Claude `--permission-mode plan`), plus any `--add-dir` | Never — a `work` session cannot be elevated into an executor in place | Yes, via `plan_task` calls the launched agent makes |
 | `audit-index` | The directory argument you pass | Scans that tree read-only | Never | No model calls |
 | `index` | The directory argument you pass | Scans that tree | Writes to the shared `~/.orchestrator/chroma` vector store — not the source repo | Yes, embeddings only, and only accepts remote transmission for repos classified `remote-approved` |
@@ -131,10 +197,18 @@ Two things worth calling out explicitly when you have many repos in play:
 - **A single plan/approve/execute cycle is scoped to one repo.** There is no
   way to approve a change that writes across two repositories in one cycle —
   run the lifecycle separately per repo.
-- **`--add-dir` and `permissions.additionalDirectories` only extend reads,
-  never writes.** They let a Claude Code executor *see* a second directory
-  (e.g., a shared library sibling repo) while it works — write scope is still
-  governed entirely by that repo's own `--allow` patterns.
+- **`--deny` always overrides `--allow`.** Both are write-scope controls, not
+  read filters. They are normalized, stored in the plan digest, and cannot be
+  changed after approval. Claude receives pre-write tool/sandbox deny rules;
+  Codex and Claude are both checked after execution. Target path validation is
+  still not an automatic rollback boundary.
+- **Structured `--add-dir` is approval-bound read context.** Put it on
+  `plan --allow`, not `execute`. Each value must resolve to a separate Git repo;
+  its state and policy are signed into the plan, rechecked at approval and
+  execution, protected with executor-specific write restrictions, and checked
+  again after execution. Avoid broad persistent
+  `permissions.additionalDirectories`, because Claude's native setting follows
+  the active permission mode and is not inherently read-only.
 - **Check classification across every repo at once with `orchestrate policy`.**
   It walks a directory tree (default `~/Documents`), finds every independent
   Git repository beneath it — stopping at each repo's own `.git` boundary, so
@@ -268,12 +342,31 @@ $ORCHESTRATE_BIN plan \
 
 The command prints the plan and exits. Its output is a proposal, not approval
 to implement it. Add one or more `--allow` values to create a structured plan
-record suitable for the separate `approve` and `execute` commands.
+record suitable for the separate `approve` and `execute` commands. Add repeatable
+`--deny` values to subtract protected paths from that scope. A deny match always
+wins, regardless of option order.
+
+When the target app needs a sibling infrastructure or shared-library repository
+for context, bind it while creating that record:
+
+```sh
+$ORCHESTRATE_BIN plan \
+  "update the app using the deployed topology as context" \
+  --repo-root "$PWD" \
+  --allow '**' \
+  --deny 'infra/**' \
+  --deny '.github/**' \
+  --add-dir ../access-sysops
+```
+
+The context repo is read-only. Its canonical root, Git state, and effective
+policy are stored in the plan, so later commands stay unchanged.
 
 ### Approve and execute a structured plan
 
-The `plan --allow` command prints a plan ID and the exact plan-record path. Read
-the proposal and JSON record before continuing. Copy that path exactly:
+The `plan --allow` command prints a plan ID, any denied paths, and the exact
+plan-record path. Read the proposal and JSON record before continuing. Copy that
+path exactly:
 
 ```sh
 PLAN_FILE=/exact/path/printed/by/plan
@@ -294,11 +387,6 @@ $ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" --executor codex
 
 # To run Claude Code instead of Codex, pass --executor claude explicitly.
 $ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" --executor claude
-
-# Let that Claude Code session also read a directory outside the target repo:
-$ORCHESTRATE_BIN execute "$PLAN_FILE" "$APPROVAL_FILE" \
-  --executor claude \
-  --add-dir /path/to/shared-library
 ```
 
 Instead of copying paths, both commands accept `--latest --repo-root <repo>`
@@ -461,10 +549,12 @@ a structured plan with explicit allowed paths, review it, create an approval,
 and execute it in a new process. Codex uses `workspace-write` only for the
 approved execution process; Claude uses `acceptEdits` only at that stage.
 
-Approval is invalidated if the commit, initial working tree, or effective policy
-changes. The approval is single-use and is consumed before executor launch.
+Approval is invalidated if the allowed or denied paths, commit, initial working
+tree, or effective policy changes in the target or any approval-bound context
+repository. The approval is single-use and is consumed before executor launch.
 After execution, the CLI rejects commits and reports Git-visible paths outside
-the allowlist. It does not automatically roll changes back.
+the allowlist or matching the denylist, and rejects detected changes in context
+repositories. It does not automatically roll changes back.
 
 See [`PLAN_APPROVAL_WORKFLOW.md`](PLAN_APPROVAL_WORKFLOW.md) for the complete
 workflow and its current limitations.

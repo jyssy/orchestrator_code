@@ -263,7 +263,12 @@ def consume_approval(path: str | Path, approval: ApprovalRecord) -> ApprovalReco
     return consumed
 
 
-def normalize_allowed_paths(patterns: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+def _normalize_path_patterns(
+    patterns: list[str] | tuple[str, ...],
+    *,
+    label: str,
+    require_one: bool,
+) -> tuple[str, ...]:
     normalized: list[str] = []
     for raw_pattern in patterns:
         pattern = raw_pattern.strip().replace("\\", "/")
@@ -278,37 +283,69 @@ def normalize_allowed_paths(patterns: list[str] | tuple[str, ...]) -> tuple[str,
             or has_drive
             or ".." in path.parts
         ):
-            raise ValueError(f"Allowed path must be repository-relative: {raw_pattern}")
+            raise ValueError(
+                f"{label} path must be repository-relative: {raw_pattern}"
+            )
         if path.parts[0] == ".git":
-            raise ValueError("The .git directory cannot be included in allowed paths")
+            raise ValueError(
+                f"The .git directory cannot be included in {label.lower()} paths"
+            )
         if pattern.endswith("/"):
             pattern += "**"
         if pattern not in normalized:
             normalized.append(pattern)
-    if not normalized:
-        raise ValueError("At least one allowed path is required")
+    if require_one and not normalized:
+        raise ValueError(f"At least one {label.lower()} path is required")
     return tuple(normalized)
 
 
-def path_is_allowed(path: str, allowed_paths: tuple[str, ...]) -> bool:
+def normalize_allowed_paths(patterns: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    return _normalize_path_patterns(patterns, label="Allowed", require_one=True)
+
+
+def normalize_denied_paths(patterns: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    return _normalize_path_patterns(patterns, label="Denied", require_one=False)
+
+
+def matching_path_pattern(path: str, patterns: tuple[str, ...]) -> str | None:
     candidate = path.replace("\\", "/")
     while candidate.startswith("./"):
         candidate = candidate[2:]
     pure = PurePosixPath(candidate)
     if not candidate or pure.is_absolute() or ".." in pure.parts:
-        return False
-    for pattern in allowed_paths:
+        return None
+    for pattern in patterns:
         prefix = pattern.removesuffix("/**")
         if prefix != pattern and (candidate == prefix or candidate.startswith(f"{prefix}/")):
-            return True
+            return pattern
         if pure.match(pattern):
-            return True
-    return False
+            return pattern
+    return None
+
+
+def path_is_allowed(path: str, allowed_paths: tuple[str, ...]) -> bool:
+    return matching_path_pattern(path, allowed_paths) is not None
+
+
+def path_is_denied(path: str, denied_paths: tuple[str, ...]) -> bool:
+    return matching_path_pattern(path, denied_paths) is not None
 
 
 def validate_changed_paths(
-    changed_paths: set[str] | tuple[str, ...], allowed_paths: tuple[str, ...]
+    changed_paths: set[str] | tuple[str, ...],
+    allowed_paths: tuple[str, ...],
+    denied_paths: tuple[str, ...] = (),
 ) -> None:
+    denied = sorted(
+        (path, pattern)
+        for path in changed_paths
+        if (pattern := matching_path_pattern(path, denied_paths)) is not None
+    )
+    if denied:
+        details = ", ".join(
+            f"{path} (matched {pattern})" for path, pattern in denied
+        )
+        raise ValueError("Changed paths are explicitly denied: " + details)
     disallowed = sorted(
         path for path in changed_paths if not path_is_allowed(path, allowed_paths)
     )

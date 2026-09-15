@@ -149,6 +149,7 @@ def test_mcp_structured_plan_forwards_constraints_and_allowed_paths(monkeypatch)
         "prompt",
         repo_root="/repo",
         allowed_paths=["src/**"],
+        denied_paths=["src/generated/**"],
         effective_constraints="Do not commit.",
     )
 
@@ -157,6 +158,7 @@ def test_mcp_structured_plan_forwards_constraints_and_allowed_paths(monkeypatch)
         "prompt": "prompt",
         "repo_root": "/repo",
         "allowed_paths": ["src/**"],
+        "denied_paths": ["src/generated/**"],
         "effective_constraints": "Do not commit.",
         "context_path": None,
         "context_paths": None,

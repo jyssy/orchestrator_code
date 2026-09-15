@@ -289,18 +289,37 @@ claude mcp add --scope user orchestrator \
 Note: `claude mcp list` only shows servers in scope for the current directory.
 Run it from within a repo where the server is registered to confirm it appears.
 
-**Directory-read permissions.** A Claude Code executor subprocess (from
-`work --executor claude` or `execute --executor claude`) is launched with
-`cwd` set to the target repository, so its file tools default to that tree.
-Two independent knobs extend this:
+**Directory-read permissions.** A guarded executor starts in the target
+repository. If an app change occasionally needs a sibling infrastructure or
+shared-library repo for context, bind that Git repository when creating the
+structured plan:
 
-- Per-launch: pass `--add-dir /path/to/other/directory` (repeatable) to
-  `work` or `execute`; it forwards to Claude Code's native `--add-dir` flag
-  for that one subprocess only.
-- Per-session (interactive `claude`, not the orchestrator subprocess): set
-  `permissions.additionalDirectories` in `.claude/settings.json` (project) or
-  `~/.claude/settings.json` (global), e.g. `["~/Documents"]` to cover every
-  repo under a workspace root without per-project reconfiguration.
+```sh
+orchestrate plan "describe the change" --allow '**' \
+  --deny 'infra/**' --deny '.github/**' \
+  --add-dir ../access-sysops
+orchestrate approve --latest
+orchestrate execute --latest --print-only
+orchestrate execute --latest                 # Codex (default), or use:
+# orchestrate execute --latest --executor claude
+```
+
+The canonical context root, Git state, and policy become part of the plan.
+`approve` and `execute` revalidate them automatically, so neither command needs
+another flag. The `--deny` patterns also remain bound to the plan and always
+override `--allow`. Codex retains a target-only write sandbox. Claude receives
+the context through its native `--add-dir` together with invocation-local edit
+denials and sandbox `denyWrite` rules; the same mechanisms protect target paths
+listed by `--deny`. Execution also checks afterward that the context repo did
+not change. Guarded Claude launches ignore persistent user, project, and local
+settings sources so an unrelated `additionalDirectories` entry cannot silently
+widen the invocation.
+
+For the compatibility-only, read-only planning subprocess, `work --executor
+claude --add-dir /path/to/repo` remains available. Do not use broad persistent
+`permissions.additionalDirectories` for guarded work: Claude applies native
+additional-directory permissions according to the active permission mode, so
+that setting is not inherently read-only.
 
 **Additional secret protection:** Create a `.claudeignore` at the root of any repo with
 sensitive material to block Claude Code's file tools from reading those paths:

@@ -14,7 +14,9 @@ from orchestrator.approval import (
     find_latest_unconsumed_approval,
     load_approval,
     normalize_allowed_paths,
+    normalize_denied_paths,
     path_is_allowed,
+    path_is_denied,
     resolve_latest_execution_records,
     save_approval,
     save_plan,
@@ -28,8 +30,14 @@ from orchestrator.context import (
     load_policy_identity,
     reload_policy_identity,
 )
-from orchestrator.models import PolicyIdentity, RepositorySnapshot, StructuredPlan
+from orchestrator.models import (
+    PolicyIdentity,
+    ReadOnlyContext,
+    RepositorySnapshot,
+    StructuredPlan,
+)
 from orchestrator.results import ComponentResult, ResultStatus
+from orchestrator.workflow import validate_read_only_contexts
 
 
 def make_plan(tmp_path, *, allowed_paths=("orchestrator/**",)):
@@ -70,6 +78,52 @@ def test_structured_plan_roundtrip_and_tamper_detection(tmp_path):
     tampered["task"] = "Different task"
     with pytest.raises(ValueError, match="plan_id does not match"):
         StructuredPlan.from_json(json.dumps(tampered))
+
+
+def test_structured_plan_roundtrip_binds_read_only_context(tmp_path):
+    context = ReadOnlyContext(
+        repository=RepositorySnapshot(
+            repo_root=str((tmp_path / "infra").resolve()),
+            base_commit="def456",
+            working_tree_fingerprint="infra-tree",
+            changed_paths=("existing.tf",),
+        ),
+        policy=PolicyIdentity(fingerprint="infra-policy", sources=()),
+    )
+    base = make_plan(tmp_path / "app")
+    plan = StructuredPlan.create(
+        task=base.task,
+        repository=base.repository,
+        policy=base.policy,
+        effective_constraints=base.effective_constraints,
+        allowed_paths=base.allowed_paths,
+        prohibited_operations=base.prohibited_operations,
+        required_checks=base.required_checks,
+        proposal=base.proposal,
+        read_only_contexts=(context,),
+    )
+
+    assert StructuredPlan.from_json(plan.to_json()) == plan
+    assert "read_only_contexts" in json.loads(plan.to_json())
+
+
+def test_deny_patterns_change_plan_digest_and_roundtrip(tmp_path):
+    base = make_plan(tmp_path / "repo")
+    denied = StructuredPlan.create(
+        task=base.task,
+        repository=base.repository,
+        policy=base.policy,
+        effective_constraints=base.effective_constraints,
+        allowed_paths=base.allowed_paths,
+        prohibited_operations=base.prohibited_operations,
+        required_checks=base.required_checks,
+        proposal=base.proposal,
+        denied_paths=("infra/**",),
+    )
+
+    assert denied.plan_id != base.plan_id
+    assert StructuredPlan.from_json(denied.to_json()) == denied
+    assert "denied_paths" not in json.loads(base.to_json())
 
 
 def test_approval_is_exact_single_use_and_detects_drift(tmp_path):
@@ -185,15 +239,91 @@ def test_structured_planning_binds_constraints_policy_and_repository(
         repo_root=str(repo),
         allowed_paths=["orchestrator/**"],
         effective_constraints="Do not commit.",
+        denied_paths=["orchestrator/generated/**", "orchestrator/generated/**"],
     )
 
     assert "repository policy" in received["context"]
     assert "Do not commit." in received["context"]
     assert plan.effective_constraints == "Do not commit."
     assert plan.repository.repo_root == str(repo.resolve())
+    assert plan.denied_paths == ("orchestrator/generated/**",)
     assert reload_policy_identity(
         plan.policy.sources, plan.effective_constraints
     ) == plan.policy
+
+
+def test_structured_planning_binds_and_retrieves_separate_read_only_repo(
+    tmp_path, monkeypatch
+):
+    app_repo = tmp_path / "app"
+    infra_repo = tmp_path / "infra"
+    init_repo(app_repo)
+    init_repo(infra_repo)
+    (infra_repo / "AGENTS.md").write_text("infra repository policy")
+    subprocess.run(["git", "add", "AGENTS.md"], cwd=infra_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "policy"], cwd=infra_repo, check=True)
+    received = {}
+
+    monkeypatch.setattr(
+        pipeline,
+        "reason_result",
+        lambda prompt, context="": (
+            received.update(context=context)
+            or ComponentResult(
+                "specialist",
+                ResultStatus.SUCCESS,
+                "## Scope\nUse the approved read-only context.",
+            )
+        ),
+    )
+
+    def fake_retrieval(prompt, repo_root=None):
+        value = "infra deployment topology" if repo_root == str(infra_repo) else ""
+        return ComponentResult("retrieval", ResultStatus.SUCCESS, value)
+
+    monkeypatch.setattr(pipeline, "retrieve_context_result", fake_retrieval)
+
+    plan = pipeline.plan_structured(
+        "Update app configuration",
+        repo_root=str(app_repo),
+        allowed_paths=["tracked.txt"],
+        effective_constraints="Do not edit infrastructure.",
+        read_only_context_roots=[str(infra_repo)],
+    )
+
+    assert len(plan.read_only_contexts) == 1
+    assert plan.read_only_contexts[0].repository.repo_root == str(infra_repo)
+    assert "infra deployment topology" in received["context"]
+    assert validate_read_only_contexts(plan)[str(infra_repo)].base_commit
+
+    (infra_repo / "tracked.txt").write_text("drift\n")
+    with pytest.raises(ValueError, match="Read-only context.*working tree"):
+        validate_read_only_contexts(plan)
+
+
+def test_structured_planning_requires_add_dir_to_name_separate_repo_root(tmp_path):
+    app_repo = tmp_path / "app"
+    infra_repo = tmp_path / "infra"
+    init_repo(app_repo)
+    init_repo(infra_repo)
+    nested = infra_repo / "nested"
+    nested.mkdir()
+
+    with pytest.raises(ValueError, match="must name a Git repository root"):
+        pipeline.plan_structured(
+            "Inspect infra",
+            repo_root=str(app_repo),
+            allowed_paths=["tracked.txt"],
+            read_only_context_roots=[str(nested)],
+        )
+
+    with pytest.raises(ValueError, match="must be separate from the target"):
+        pipeline.plan_structured(
+            "Inspect app",
+            repo_root=str(app_repo),
+            allowed_paths=["tracked.txt"],
+            read_only_context_roots=[str(app_repo)],
+        )
 
 
 def test_allowed_paths_reject_escape_git_and_scope_violations():
@@ -212,6 +342,26 @@ def test_allowed_paths_reject_escape_git_and_scope_violations():
         normalize_allowed_paths([".git/config"])
     with pytest.raises(ValueError, match="exceed the approved scope"):
         validate_changed_paths({"orchestrator/models.py", "SETUP.md"}, allowed)
+
+
+def test_denied_paths_override_broad_allow_and_report_matching_pattern():
+    allowed = normalize_allowed_paths(["**"])
+    denied = normalize_denied_paths(
+        ["infra/**", ".github/**", "**/migrations/**", "infra/**"]
+    )
+
+    assert denied == ("infra/**", ".github/**", "**/migrations/**")
+    assert path_is_denied("infra/main.tf", denied)
+    assert path_is_denied("accounts/migrations/0001_initial.py", denied)
+    assert not path_is_denied("accounts/views.py", denied)
+    assert not path_is_allowed("../outside", allowed)
+    validate_changed_paths({"accounts/views.py"}, allowed, denied)
+    with pytest.raises(ValueError, match=r"infra/main\.tf \(matched infra/\*\*\)"):
+        validate_changed_paths({"infra/main.tf"}, allowed, denied)
+    with pytest.raises(ValueError, match="repository-relative"):
+        normalize_denied_paths(["../outside"])
+    with pytest.raises(ValueError, match=".git"):
+        normalize_denied_paths([".git/**"])
 
 
 def test_approval_does_not_match_modified_plan(tmp_path):

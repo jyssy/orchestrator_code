@@ -1,0 +1,195 @@
+EXECUTION LIMITS AND ROLLBACK SCOPE
+===================================
+
+Purpose
+-------
+
+This note records limitations of the guarded plan/approve/execute workflow that
+remain after adding approval-bound read-only context repositories and target
+write-path --allow/--deny patterns. It is a design reference for future work,
+not an authorization to change executor behavior.
+
+
+Current command flow
+--------------------
+
+The normal human workflow remains:
+
+  orchestrate plan "describe the change" \
+    --allow '**' \
+    --deny 'infra/**' \
+    --deny '.github/**'
+
+  orchestrate approve --latest
+  orchestrate execute --latest --print-only
+  orchestrate execute --latest                    # Codex (default)
+
+To use Claude instead for the real execution:
+
+  orchestrate execute --latest --executor claude
+
+The human must choose one real executor command. Approval is single-use.
+
+
+Executor switching
+------------------
+
+An executor cannot be hot-swapped during a running execution session. The
+approval is consumed immediately before the executor is launched, even if the
+executor later fails, is interrupted, or produces no changes.
+
+To switch executors after launch:
+
+1. Stop the current executor safely.
+2. Inspect the target repository and preserve all existing changes.
+3. Create a new plan from the resulting working-tree state.
+4. Review and approve the new plan.
+5. Start the other executor with the new approval.
+
+Existing uncommitted changes remain on disk and become part of the new plan's
+starting working-tree fingerprint. Never clean, reset, restore, overwrite, or
+discard them without first identifying their owner and obtaining explicit human
+authorization.
+
+
+Target-repository write scope
+-----------------------------
+
+--allow grants target-repository write scope. --deny subtracts from that scope
+and always wins when both patterns match. These patterns do not restrict reads.
+
+For Codex:
+
+- The native workspace-write sandbox limits writes to the target workspace but
+  does not enforce individual --allow/--deny patterns inside that workspace.
+- Codex receives the approved paths in its prompt.
+- After Codex exits, deterministic Python validation compares Git-visible
+  changes with the allowed and denied patterns.
+- A denied or out-of-scope write is therefore detected after it has already
+  reached the real working tree.
+
+For Claude:
+
+- Target --deny patterns are translated into invocation-local Edit/Write denial
+  rules and sandbox denyWrite entries.
+- Those rules are intended to block matching writes before they occur.
+- The same post-execution Git-visible validation still runs as a second layer.
+- Pre-write enforcement depends on the installed Claude CLI and sandbox honoring
+  the generated rules; it does not remove the need for final validation.
+
+For approval-bound --add-dir context repositories:
+
+- They are read-only context, never additional write targets.
+- Codex does not receive them as additional writable directories.
+- Claude receives repository-wide Edit/Write and sandbox write denials.
+- Their Git and policy state is checked before approval and execution, and their
+  repository snapshot is checked again after execution.
+
+
+Git-visible detection gap
+-------------------------
+
+Target scope validation is based on Git status and metadata for Git-visible
+dirty paths. A file ignored by Git may not appear in that inventory. For
+example, an ignored local settings file, generated directory, or build output
+could be modified without the current target validator reporting it.
+
+This gap does not authorize access to environment files, credentials, private
+keys, Terraform state, vault data, or other secret material. Those remain
+prohibited context. It means only that Git status is not a complete filesystem
+change detector.
+
+
+Rollback behavior
+-----------------
+
+The orchestrator does not automatically roll back a failed executor or a scope
+violation. Automatic Git restore/reset/clean operations could destroy unrelated
+human work, including changes that existed before execution.
+
+If validation fails:
+
+- The command reports the violation and exits unsuccessfully.
+- The approval remains consumed.
+- Changes made in the real target working tree remain present.
+- The human must inspect git status, the final diff, untracked files, and any
+  relevant ignored outputs before deciding what should be retained or repaired.
+- Recovery must be targeted and ownership-aware. Do not use broad destructive
+  Git commands as a generic recovery procedure.
+- Any continuation or executor switch requires a new plan and approval based on
+  the repository's current state.
+
+
+Proposed complete fix: isolated execution and controlled promotion
+------------------------------------------------------------------
+
+The preferred future design is to prevent executor changes from reaching the
+real working tree until the complete result validates:
+
+  approved target state
+          |
+          v
+  disposable isolated workspace
+          |
+          v
+  run Codex or Claude in isolation
+          |
+          v
+  inventory all filesystem changes
+          |
+          v
+  reject commits, denied paths, and out-of-scope paths
+          |
+          v
+  revalidate the real target for drift
+          |
+          v
+  promote only validated changes to the real repository
+
+Required properties:
+
+1. Preserve the approved base commit and all safe pre-existing tracked and
+   untracked work needed by the task.
+2. Exclude prohibited secret-bearing paths from model context and staging logic.
+3. Keep the isolated repository metadata independent so executor commits cannot
+   mutate the real repository's object database or refs.
+4. Detect changes beyond Git-visible files, including ignored outputs, without
+   reading or transmitting prohibited secret contents.
+5. Reject every path matching --deny before promotion, even if --allow also
+   matches it.
+6. Reject every changed path that does not match --allow.
+7. Recheck the real repository immediately before promotion; abort if its commit,
+   working tree, policy, or approval-bound context has drifted.
+8. Apply only validated changes and produce an exact handoff of promoted,
+   rejected, and untouched paths.
+9. Never automatically discard the isolated workspace when retaining it is
+   necessary for diagnosis; report its location and cleanup status safely.
+
+With this design, the human-facing commands should not change. A failed or
+out-of-scope execution would leave the real target repository untouched and
+report that no changes were promoted.
+
+
+Open design questions
+---------------------
+
+- How to build an isolated workspace portably on macOS and Linux without
+  copying or exposing prohibited secret files.
+- How to reproduce approved dirty and untracked state without conflating it with
+  executor-created changes.
+- How to handle symlinks, submodules, nested repositories, file deletions,
+  renames, modes, and large binary files during promotion.
+- Whether a failed isolated run should always consume approval or permit a
+  narrowly defined retry that cannot change task, scope, executor inputs, or
+  repository state.
+- How long diagnostic workspaces may be retained and how an authorized human
+  should remove them.
+
+
+Checks that remain human-visible
+--------------------------------
+
+Until isolated promotion is implemented, always review the repository state and
+final diff after execution. Treat a successful scope report as evidence about
+Git-visible changes, not proof that every ignored file on the filesystem was
+unchanged.

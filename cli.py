@@ -60,6 +60,8 @@ from orchestrator.workflow import (
     guard_external_agent_prompt,
     resolve_target_repo,
     validate_execution_result,
+    validate_read_only_context_results,
+    validate_read_only_contexts,
 )
 
 app = typer.Typer(help="REALMS + local model orchestrator")
@@ -177,6 +179,18 @@ def plan_command(
         "--allow",
         help="Repository-relative allowed write path; repeat to create a plan record",
     ),
+    denied_paths: list[str] = typer.Option(  # noqa: B008 - Typer declaration
+        None,
+        "--deny",
+        help="Repository-relative write path excluded from --allow; repeat to add "
+        "more. Deny always wins.",
+    ),
+    add_dir: list[str] = typer.Option(
+        None,
+        "--add-dir",
+        help="Separate Git repository the approved executor may inspect read-only; "
+        "repeat to add more. Requires --allow and is stored in the plan.",
+    ),
     effective_constraints: str = typer.Option(
         DEFAULT_EFFECTIVE_CONSTRAINTS,
         "--constraints",
@@ -190,6 +204,9 @@ def plan_command(
         raise typer.BadParameter(str(exc)) from exc
 
     console.print(f"[bold cyan]Repository:[/bold cyan] {target}")
+    if (add_dir or denied_paths) and not allowed_paths:
+        option = "--add-dir" if add_dir else "--deny"
+        raise typer.BadParameter(f"{option} requires --allow to create a bound plan")
     plan_reviewer = model_role_label("Reviewer", reasoning_model())
     console.print(f"[dim]{plan_reviewer}: generating a read-only plan...[/dim]")
     if allowed_paths:
@@ -199,11 +216,20 @@ def plan_command(
             repo_root=str(target),
             allowed_paths=allowed_paths,
             effective_constraints=effective_constraints,
+            read_only_context_roots=add_dir,
+            denied_paths=denied_paths,
         )
         plan_path = save_plan(structured)
         proposal = structured.proposal
         console.print(f"[bold green]Plan ID:[/bold green] {structured.plan_id}")
         console.print(f"[bold green]Plan record:[/bold green] {plan_path}")
+        for context in structured.read_only_contexts:
+            console.print(
+                "[bold cyan]Read-only context:[/bold cyan] "
+                f"{context.repository.repo_root}"
+            )
+        for denied_path in structured.denied_paths:
+            console.print(f"[bold red]Denied write path:[/bold red] {denied_path}")
         console.print(
             "[dim]Review the proposal and record, then run "
             f"`orchestrate approve {shlex.quote(str(plan_path))}`.[/dim]"
@@ -274,6 +300,7 @@ def approve_command(
             current_working_tree_fingerprint=snapshot.working_tree_fingerprint,
             current_policy_fingerprint=policy.fingerprint,
         )
+        validate_read_only_contexts(structured)
         approval = create_approval(structured, approved_by or getpass.getuser())
         approval_path = save_approval(approval)
     except (OSError, TypeError, ValueError) as exc:
@@ -308,12 +335,6 @@ def execute_command(
         "-e",
         help="Write-capable executor to launch",
         case_sensitive=False,
-    ),
-    add_dir: list[str] = typer.Option(
-        None,
-        "--add-dir",
-        help="Additional directory Claude Code may read beyond the target repository; "
-        "repeat to add more. Ignored for Codex.",
     ),
     print_only: bool = typer.Option(
         False,
@@ -352,7 +373,8 @@ def execute_command(
             current_working_tree_fingerprint=before.working_tree_fingerprint,
             current_policy_fingerprint=policy.fingerprint,
         )
-        command = build_execution_command(structured, executor, add_dirs=add_dir)
+        read_only_before = validate_read_only_contexts(structured)
+        command = build_execution_command(structured, executor)
     except (OSError, TypeError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -369,7 +391,11 @@ def execute_command(
         return
 
     try:
-        guard_external_agent_prompt(command[-1], target)
+        guard_external_agent_prompt(
+            command[-1],
+            target,
+            read_only_context_roots=tuple(Path(root) for root in read_only_before),
+        )
     except (RuntimeError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -391,6 +417,11 @@ def execute_command(
     metadata_paths = tuple(sorted(set(before.changed_paths) | set(after.changed_paths)))
     after_metadata = capture_path_metadata(target, metadata_paths)
     try:
+        read_only_after = {
+            root: capture_repository_snapshot(Path(root))
+            for root in read_only_before
+        }
+        validate_read_only_context_results(read_only_before, read_only_after)
         changed = validate_execution_result(
             structured,
             before,

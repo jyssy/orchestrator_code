@@ -7,6 +7,7 @@ from pathlib import Path
 from orchestrator.approval import (
     DEFAULT_PROHIBITED_OPERATIONS,
     normalize_allowed_paths,
+    normalize_denied_paths,
 )
 from orchestrator.context import (
     capture_repository_snapshot,
@@ -20,7 +21,7 @@ from orchestrator.context import (
 from orchestrator.egress_guard import ModelEgressBlocked, egress_scope, guard_text
 from orchestrator.judge import critique_and_revise_result
 from orchestrator.model_gateway import ProviderFailure
-from orchestrator.models import PolicyIdentity, StructuredPlan
+from orchestrator.models import PolicyIdentity, ReadOnlyContext, StructuredPlan
 from orchestrator.rag import retrieve_context_result
 from orchestrator.results import ComponentResult, ResultStatus, diagnostic
 from orchestrator.router import classify_result
@@ -130,6 +131,66 @@ def _request_policy_roots(repo_root: Path, context_paths: list[str]) -> list[Pat
     return roots
 
 
+def _paths_overlap(first: Path, second: Path) -> bool:
+    """Return whether either resolved path contains the other."""
+    try:
+        first.relative_to(second)
+        return True
+    except ValueError:
+        pass
+    try:
+        second.relative_to(first)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_read_only_contexts(
+    values: list[str] | None,
+    *,
+    target_root: Path,
+    effective_constraints: str | None,
+) -> tuple[ReadOnlyContext, ...]:
+    """Resolve, deduplicate, and snapshot approval-bound context repositories."""
+    contexts: list[ReadOnlyContext] = []
+    seen: set[Path] = set()
+    for raw_value in values or []:
+        candidate = Path(raw_value).expanduser().resolve()
+        if not candidate.is_dir():
+            raise ValueError(f"Read-only context path is not a directory: {candidate}")
+        context_root = find_repo_root(candidate)
+        if context_root is None:
+            raise ValueError(
+                f"Read-only context path is not inside a Git repository: {candidate}"
+            )
+        context_root = context_root.resolve()
+        if candidate != context_root:
+            raise ValueError(
+                "--add-dir must name a Git repository root, not a path inside it: "
+                f"{candidate}"
+            )
+        if _paths_overlap(target_root, context_root):
+            raise ValueError(
+                "Read-only context repository must be separate from the target "
+                f"repository: {context_root}"
+            )
+        if context_root in seen:
+            continue
+        seen.add(context_root)
+        _, policy, _ = load_policy_identity(
+            context_root,
+            target_path=candidate,
+            effective_constraints=effective_constraints,
+        )
+        contexts.append(
+            ReadOnlyContext(
+                repository=capture_repository_snapshot(context_root),
+                policy=policy,
+            )
+        )
+    return tuple(contexts)
+
+
 def _build_context(
     prompt: str,
     *,
@@ -138,6 +199,7 @@ def _build_context(
     context_paths: list[str] | None,
     effective_constraints: str | None = None,
     component_results: list[ComponentResult[object]] | None = None,
+    read_only_context_roots: tuple[Path, ...] = (),
 ) -> tuple[str, Path | None, PolicyIdentity]:
     paths = _normalize_context_paths(context_path, context_paths)
     resolved_root = resolve_repo_root(repo_root, paths)
@@ -149,7 +211,10 @@ def _build_context(
             resolved_root,
             target_path=target,
             effective_constraints=effective_constraints,
-            model_egress_roots=_request_policy_roots(resolved_root, paths),
+            model_egress_roots=[
+                *_request_policy_roots(resolved_root, paths),
+                *read_only_context_roots,
+            ],
         )
         if guidance:
             guard_text(guidance, source="effective agent guidance")
@@ -181,6 +246,19 @@ def _build_context(
         component_results.append(retrieval_result)
     if retrieval_result.usable and retrieval_result.value:
         sections.append(retrieval_result.value)
+
+    for context_root in read_only_context_roots:
+        retrieval_result = retrieve_context_result(
+            prompt,
+            repo_root=str(context_root),
+        )
+        if component_results is not None:
+            component_results.append(retrieval_result)
+        if retrieval_result.usable and retrieval_result.value:
+            sections.append(
+                "### Retrieved read-only context: "
+                f"{context_root}\n{retrieval_result.value}"
+            )
 
     return (
         "\n\n---\n\n".join(section for section in sections if section),
@@ -238,6 +316,8 @@ def plan_structured(
     context_paths: list[str] | None = None,
     prohibited_operations: list[str] | None = None,
     required_checks: list[str] | None = None,
+    read_only_context_roots: list[str] | None = None,
+    denied_paths: list[str] | None = None,
 ) -> StructuredPlan:
     """Create a versioned plan bound to repository and policy state."""
     task = prompt.strip()
@@ -249,11 +329,24 @@ def plan_structured(
             f"Task appears to contain prohibited secret material ({secret_reason})"
         )
     normalized_allowed_paths = normalize_allowed_paths(allowed_paths)
+    normalized_denied_paths = normalize_denied_paths(denied_paths or [])
     paths = _normalize_context_paths(context_path, context_paths)
     resolved_root = resolve_repo_root(repo_root, paths)
     if resolved_root is None:
         raise ValueError("A repository root is required for a structured plan")
-    classification = _request_data_classification(resolved_root, paths)
+    resolved_root = resolved_root.resolve()
+    read_only_contexts = _resolve_read_only_contexts(
+        read_only_context_roots,
+        target_root=resolved_root,
+        effective_constraints=effective_constraints,
+    )
+    context_roots = tuple(
+        Path(context.repository.repo_root) for context in read_only_contexts
+    )
+    classification = _request_data_classification(
+        resolved_root,
+        [*paths, *(str(root) for root in context_roots)],
+    )
     with egress_scope(classification):
         guard_text(task, source="user task")
         components: list[ComponentResult[object]] = []
@@ -264,6 +357,7 @@ def plan_structured(
             context_paths=context_paths,
             effective_constraints=effective_constraints,
             component_results=components,
+            read_only_context_roots=context_roots,
         )
         planning_result = reason_result(
             f"{_PLAN_SYSTEM}\n\nTask:\n{prompt}", context=context
@@ -288,6 +382,8 @@ def plan_structured(
         ),
         required_checks=tuple(required_checks or ("pytest", "git diff --check")),
         proposal=proposal,
+        read_only_contexts=read_only_contexts,
+        denied_paths=normalized_denied_paths,
     )
 
 

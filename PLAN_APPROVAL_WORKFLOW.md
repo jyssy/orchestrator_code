@@ -9,8 +9,10 @@ read-only plan -> review -> approval record -> state validation
 ```
 
 The workflow binds approval to the exact task, repository root, base commit,
-working-tree fingerprint, effective policy fingerprint, allowed paths, and plan
-proposal. Approval records are single-use.
+working-tree fingerprint, effective policy fingerprint, allowed paths, denied
+paths, and plan proposal. Optional read-only context repositories are also bound
+to their exact roots, Git state, and policy identities. Approval records are
+single-use.
 
 ## Create a structured plan
 
@@ -35,6 +37,38 @@ paths, parent traversal, null bytes, and `.git/**` are rejected. A pattern endin
 in `/**` includes that directory and all descendants; a trailing slash is
 normalized to the same form. Other patterns use `PurePosixPath.match()`
 semantics, so review the recorded allowlist before approval.
+
+Use repeatable `--deny` patterns to subtract protected paths from a broad allow:
+
+```sh
+orchestrate plan "refactor the Django application" \
+  --allow '**' \
+  --deny 'infra/**' \
+  --deny '.github/**' \
+  --deny '**/migrations/**'
+```
+
+Denied paths use the same repository-relative normalization and validation as
+allowed paths. A deny match always overrides an allow match, regardless of CLI
+option order. Both lists are stored in the plan digest, so changing either list
+requires a new plan and approval. These patterns control writes, not reads.
+
+If the target repository needs code from a separate Git repository as context,
+add it while creating the structured plan:
+
+```sh
+cd /path/to/application
+orchestrate plan "update the app" --allow 'src/**' \
+  --add-dir ../access-sysops
+orchestrate approve --latest
+orchestrate execute --latest
+```
+
+`--add-dir` is repeatable and requires `--allow`. Each path must name the root
+of a Git repository separate from the target and is recorded as read-only
+context. Do not repeat the option on `approve` or `execute`; both commands load
+it from the signed plan. The planner can use existing repository-scoped RAG
+entries for that context without rebuilding an index.
 
 ## Review and approve
 
@@ -67,8 +101,10 @@ Before starting a write-capable process, the command validates:
 
 - Plan and approval schema versions and content-derived identifiers.
 - Exact task, repository, base commit, and initial working-tree identity.
+- Exact allowed and denied write patterns through the plan digest.
 - Effective repository guidance and caller-constraint fingerprint.
 - Effective repository model-egress policy, including an absent-policy state.
+- Exact Git and effective-policy state for every read-only context repository.
 - Whether the approval was previously consumed.
 
 Execution accepts only the canonical approval path printed by `approve`; copied
@@ -80,10 +116,22 @@ The execution prompt requires `ask_orchestrator` to receive the same task,
 repository root, and sanitized effective constraints used for planning. The
 prior plan proposal is treated as advisory evidence, not policy.
 
+Codex executes with only the target as a writable workspace. For Claude, the
+CLI translates target-repository deny patterns into invocation-local
+`Edit`/`Write` and sandbox `denyWrite` rules. It also supplies each bound context
+repo with native `--add-dir` plus deny rules covering that entire repo; sandbox
+startup fails closed if unavailable and unsandboxed commands are disabled.
+After either executor exits, context repository snapshots must still match their
+pre-launch state. Guarded Claude launches do not load persistent user, project,
+or local settings sources, preventing an unrelated `additionalDirectories`
+entry from widening the session.
+
 After the executor exits, the command rejects commits and reports any newly
-Git-visible change outside the approved path patterns. It also uses file
-metadata to detect ordinary edits to paths that were already dirty at planning
-time. It never reads file contents for this working-tree fingerprint.
+Git-visible change outside the allowed patterns or matching a denied pattern.
+Denied matches are checked first and report the matching pattern. The command
+also uses file metadata to detect ordinary edits to paths that were already
+dirty at planning time. It never reads file contents for this working-tree
+fingerprint.
 
 Run `execute --print-only` immediately before real execution to validate the
 records and preview the exact command without consuming approval or launching
@@ -133,7 +181,8 @@ Existing `plan_task` and `ask_orchestrator` tools remain available. Both accept
 an optional `effective_constraints` string so clients can propagate the same
 sanitized constraints.
 
-`plan_task_structured` returns a versioned JSON plan without writing it.
+`plan_task_structured` returns a versioned JSON plan without writing it and
+accepts optional `denied_paths` alongside required `allowed_paths`.
 `validate_plan_approval` validates supplied plan and approval JSON against the
 current repository and policy state. The MCP server does not create approvals
 or launch a write-capable executor; those remain explicit client or CLI actions.
@@ -158,11 +207,15 @@ The phase establishes a technical boundary before write-capable execution: no
 executor is launched until a matching, current, unconsumed approval validates.
 It also validates Git-visible scope after execution.
 
-This is not an operating-system path sandbox. A write-capable executor can make
-an out-of-scope change before post-execution validation detects it, and ignored
-files are not included in Git-visible scope checks. The command deliberately
-does not attempt an automatic rollback because doing so could destroy unrelated
-work. Review the final diff and repository state before integrating changes.
+The target repository's `--allow`/`--deny` patterns are still post-execution
+validation for Codex, not per-path operating-system enforcement: a write-capable
+executor can make an out-of-scope target-repo change before validation detects
+it, and ignored files are not included in Git-visible scope checks. Claude gets
+additional pre-write deny rules for target denied paths, and context repos get
+executor-specific sandbox/deny protection. The command deliberately performs no
+automatic rollback if any validation fails because rollback could destroy
+unrelated work. Review the final diff and repository state before integrating
+changes.
 
 Later phases may add isolated worktrees or a narrower filesystem sandbox for
 pre-write path enforcement. Phase 2A now guards orchestrator model calls and the

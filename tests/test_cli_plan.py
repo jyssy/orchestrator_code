@@ -5,7 +5,12 @@ from typer.testing import CliRunner
 import cli
 from orchestrator.approval import load_approval, save_plan
 from orchestrator.context import capture_repository_snapshot, load_policy_identity
-from orchestrator.models import StructuredPlan
+from orchestrator.models import (
+    PolicyIdentity,
+    ReadOnlyContext,
+    RepositorySnapshot,
+    StructuredPlan,
+)
 
 
 def test_plan_command_prints_plan_without_execution_or_approval(tmp_path, monkeypatch):
@@ -80,6 +85,106 @@ def test_plan_command_requires_a_git_repository(tmp_path, monkeypatch):
 
     assert result.exit_code == 2
     assert "not inside a Git repository" in result.stderr
+
+
+def test_plan_command_stores_add_dir_in_structured_plan(tmp_path, monkeypatch):
+    repo = tmp_path / "app"
+    context_repo = tmp_path / "infra"
+    repo.mkdir()
+    context_repo.mkdir()
+    (repo / ".git").mkdir()
+    (context_repo / ".git").mkdir()
+    received = {}
+    context = ReadOnlyContext(
+        repository=RepositorySnapshot(
+            str(context_repo.resolve()), "def", "infra-tree", ()
+        ),
+        policy=PolicyIdentity("infra-policy", ()),
+    )
+    structured = StructuredPlan.create(
+        task="Use infra context",
+        repository=RepositorySnapshot(str(repo.resolve()), "abc", "tree", ()),
+        policy=PolicyIdentity("policy", ()),
+        effective_constraints=cli.DEFAULT_EFFECTIVE_CONSTRAINTS,
+        allowed_paths=("**",),
+        prohibited_operations=("commit",),
+        required_checks=("pytest",),
+        proposal="Read infra without editing it.",
+        read_only_contexts=(context,),
+        denied_paths=("infra/**",),
+    )
+
+    def fake_structured(*args, **kwargs):
+        received.update(kwargs)
+        return structured
+
+    monkeypatch.setattr(cli, "run_structured_plan", fake_structured)
+    monkeypatch.setattr(cli, "save_plan", lambda plan: tmp_path / "plan.json")
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "plan",
+            "Use infra context",
+            "--repo-root",
+            str(repo),
+            "--allow",
+            "**",
+            "--add-dir",
+            str(context_repo),
+            "--deny",
+            "infra/**",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert received["read_only_context_roots"] == [str(context_repo)]
+    assert received["denied_paths"] == ["infra/**"]
+    assert "Read-only context:" in result.stdout
+    assert context_repo.name in result.stdout
+    assert "Denied write path: infra/**" in result.stdout
+
+
+def test_plan_command_requires_allow_when_add_dir_is_used(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "plan",
+            "Describe a change",
+            "--repo-root",
+            str(repo),
+            "--add-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--add-dir requires --allow" in result.stderr
+
+
+def test_plan_command_requires_allow_when_deny_is_used(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "plan",
+            "Describe a change",
+            "--repo-root",
+            str(repo),
+            "--deny",
+            "infra/**",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--deny requires --allow" in result.stderr
 
 
 def test_approve_and_execute_print_only_lifecycle(tmp_path, monkeypatch):

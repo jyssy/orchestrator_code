@@ -30,6 +30,13 @@ def _string_tuple(data: dict[str, Any], field: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _read_only_context_tuple(data: dict[str, Any]) -> tuple[ReadOnlyContext, ...]:
+    value = data.get("read_only_contexts", [])
+    if not isinstance(value, list):
+        raise TypeError("read_only_contexts must be a list")
+    return tuple(ReadOnlyContext.from_dict(item) for item in value)
+
+
 @dataclass(frozen=True)
 class RepositorySnapshot:
     """Read-only Git and working-tree identity captured at planning time."""
@@ -71,6 +78,23 @@ class PolicyIdentity:
 
 
 @dataclass(frozen=True)
+class ReadOnlyContext:
+    """Approval-bound repository that an executor may inspect but not edit."""
+
+    repository: RepositorySnapshot
+    policy: PolicyIdentity
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ReadOnlyContext:
+        if not isinstance(data, dict):
+            raise TypeError("read_only_contexts entries must be objects")
+        return cls(
+            repository=RepositorySnapshot.from_dict(data.get("repository")),
+            policy=PolicyIdentity.from_dict(data.get("policy")),
+        )
+
+
+@dataclass(frozen=True)
 class StructuredPlan:
     """Machine-verifiable envelope around the architect's human-readable plan."""
 
@@ -84,9 +108,17 @@ class StructuredPlan:
     prohibited_operations: tuple[str, ...]
     required_checks: tuple[str, ...]
     proposal: str
+    read_only_contexts: tuple[ReadOnlyContext, ...] = ()
+    denied_paths: tuple[str, ...] = ()
 
     def _payload(self, *, include_plan_id: bool) -> dict[str, Any]:
         data = asdict(self)
+        # Preserve the digest and serialized shape of pre-feature plans when no
+        # additional context repository is requested.
+        if not self.read_only_contexts:
+            data.pop("read_only_contexts")
+        if not self.denied_paths:
+            data.pop("denied_paths")
         if not include_plan_id:
             data.pop("plan_id")
         return data
@@ -104,6 +136,11 @@ class StructuredPlan:
             raise ValueError("plan_id does not match the plan content")
         if not self.allowed_paths:
             raise ValueError("A structured plan must contain at least one allowed path")
+        roots = [context.repository.repo_root for context in self.read_only_contexts]
+        if len(roots) != len(set(roots)):
+            raise ValueError("Read-only context repository roots must be unique")
+        if self.repository.repo_root in roots:
+            raise ValueError("The target repository cannot also be read-only context")
 
     def to_json(self) -> str:
         self.validate()
@@ -121,6 +158,8 @@ class StructuredPlan:
         prohibited_operations: tuple[str, ...],
         required_checks: tuple[str, ...],
         proposal: str,
+        read_only_contexts: tuple[ReadOnlyContext, ...] = (),
+        denied_paths: tuple[str, ...] = (),
     ) -> StructuredPlan:
         plan = cls(
             schema_version=SCHEMA_VERSION,
@@ -133,6 +172,8 @@ class StructuredPlan:
             prohibited_operations=prohibited_operations,
             required_checks=required_checks,
             proposal=proposal,
+            read_only_contexts=read_only_contexts,
+            denied_paths=denied_paths,
         )
         return replace(plan, plan_id=plan.digest)
 
@@ -158,6 +199,12 @@ class StructuredPlan:
             prohibited_operations=_string_tuple(data, "prohibited_operations"),
             required_checks=_string_tuple(data, "required_checks"),
             proposal=_require_string(data, "proposal"),
+            read_only_contexts=_read_only_context_tuple(data),
+            denied_paths=(
+                _string_tuple(data, "denied_paths")
+                if "denied_paths" in data
+                else ()
+            ),
         )
         if not isinstance(plan.effective_constraints, str):
             raise TypeError("effective_constraints must be a string")

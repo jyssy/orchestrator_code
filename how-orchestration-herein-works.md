@@ -580,14 +580,22 @@ RAG maintenance commands.
 
 Resolves a Git root and calls the pipeline directly. Without `--allow`, it keeps
 the Markdown-only compatibility behavior. With one or more `--allow` values, it
-creates a versioned plan record outside the target repository.
+creates a versioned plan record outside the target repository. Repeatable
+`--deny` patterns subtract protected paths from the allowed write scope and are
+bound into the same plan digest; deny always overrides allow. Repeatable
+`--add-dir` options may bind separate Git repositories as read-only context;
+their existing RAG entries can inform planning, and their exact Git/policy state
+becomes part of the plan.
 
 ### `orchestrate approve` and `orchestrate execute`
 
-`approve` validates current repository and policy state before creating a
-single-use approval record. `execute` validates the exact plan and approval,
-rechecks drift, consumes approval, launches a separate write-capable executor,
-and validates Git-visible changed paths after the process exits.
+`approve` validates current target/context repository and policy state before
+creating a single-use approval record. `execute` validates the exact plan and
+approval, rechecks drift, consumes approval, launches a separate write-capable
+executor, and validates target Git-visible changed paths plus context-repository
+immutability after the process exits. Codex's write sandbox remains scoped to
+the target. Claude receives invocation-local deny rules and sandbox `denyWrite`
+for target deny patterns and every bound context root.
 
 ### `orchestrate ask`
 
@@ -626,21 +634,25 @@ for an unchanged interrupted source scan.
 
 The intended end-to-end sequence is:
 
-1. The human requests a structured plan with an exact repository and explicit
-   allowed paths.
-2. The planner loads policy and repository state read-only, obtains architect
-   advice, and writes the plan record outside the target repository.
+1. The human requests a structured plan with an exact repository, explicit
+   allowed and optional denied paths, and optional read-only context
+   repositories.
+2. The planner loads target/context policy and repository state read-only,
+   obtains architect advice, and writes the plan record outside the target
+   repository.
 3. The human reviews the proposal and structured scope.
-4. `approve` verifies that repository and policy state are unchanged, then
-   creates a single-use approval record.
-5. `execute` revalidates the exact task, plan, repository, policy, and approval.
+4. `approve` verifies that target/context repository and policy state are
+   unchanged, then creates a single-use approval record.
+5. `execute` revalidates the exact task, plan, repositories, policies, and
+   approval.
 6. The approval is consumed before a separate write-capable executor starts.
 7. The executor calls `ask_orchestrator` with the same task, repository root,
    and effective caller constraints.
 8. The executor evaluates the advice, edits only approved paths, runs permitted
    checks, and reports its handoff.
-9. The CLI rejects commits and validates final Git-visible changed paths against
-   the plan allowlist.
+9. The CLI rejects commits, validates final target Git-visible changed paths
+   against the plan allowlist and denylist, and rejects context-repository
+   drift.
 
 The orchestrator is therefore the **architect and reviewer**, MCP is the
 **tool-call bridge**, the coding agent is the **executor**, and the human remains
@@ -810,9 +822,9 @@ returns unvalidated Markdown. Required plan headings are requested through
 prompting rather than validated after generation.
 
 Phase 1 wraps an architect proposal in a typed, versioned record containing the
-exact task, repository snapshot, policy identity, allowed paths, prohibited
-operations, and required checks. The proposal remains model-generated prose,
-but approval and execution validation use the structured envelope.
+exact task, repository snapshot, policy identity, allowed and denied paths,
+prohibited operations, and required checks. The proposal remains model-generated
+prose, but approval and execution validation use the structured envelope.
 
 ## Configuration and Initialization
 
@@ -935,9 +947,10 @@ future work.
 ### 2. Bind approval to a specific plan and repository state — Phase 1 delivered
 
 The CLI lifecycle now binds task, normalized repository root, Git state, policy
-fingerprint, allowed paths, and structured plan content to a single-use approval
-record. Compatibility MCP calls remain advisory and independent by design. The
-coding agent remains responsible for edits and verification.
+fingerprint, allowed and denied paths, and structured plan content to a
+single-use approval record. Compatibility MCP calls remain advisory and
+independent by design. The coding agent remains responsible for edits and
+verification.
 
 ### 3. Make evidence visible and verifiable
 
@@ -1027,10 +1040,13 @@ exist. Source inspection by the executor is mandatory.
 ### Scope enforcement is post-execution
 
 The CLI enforces approval before launching a write-capable executor and rejects
-stale or consumed approvals. Allowed-path validation occurs after the executor
-exits and covers Git-visible changes. It is not an operating-system path sandbox
-and does not automatically roll back violations, because rollback could destroy
-unrelated work.
+stale or consumed approvals. Allow/deny validation occurs after the executor
+exits and covers target-repository Git-visible changes, with deny taking
+precedence. For Codex, those patterns are not an operating-system sandbox.
+Claude also receives pre-write deny rules for target deny patterns.
+Approval-bound context repos receive executor-specific write denials and are
+checked again after execution, but the CLI does not automatically roll back
+violations because rollback could destroy unrelated work.
 
 ### Context may be incomplete
 

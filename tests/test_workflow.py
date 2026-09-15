@@ -1,8 +1,14 @@
+import json
 from pathlib import Path
 
 import pytest
 
-from orchestrator.models import PolicyIdentity, RepositorySnapshot, StructuredPlan
+from orchestrator.models import (
+    PolicyIdentity,
+    ReadOnlyContext,
+    RepositorySnapshot,
+    StructuredPlan,
+)
 from orchestrator.workflow import (
     Executor,
     build_claude_command,
@@ -12,6 +18,7 @@ from orchestrator.workflow import (
     build_execution_prompt,
     resolve_target_repo,
     validate_execution_result,
+    validate_read_only_context_results,
 )
 
 
@@ -81,6 +88,7 @@ def test_claude_planning_command_forwards_add_dir(tmp_path, monkeypatch):
         "/extra/one",
         "/extra/two",
     ]
+    assert command[command.index("--setting-sources") + 1] == ""
     assert command[-2] == "--"
 
 
@@ -129,6 +137,70 @@ def test_approved_execution_command_is_separate_and_write_capable(tmp_path, monk
     assert "ask_orchestrator" in prompt
     assert "orchestrator/**" in prompt
     assert "Proposal text is advisory" not in prompt
+
+
+def test_approved_claude_execution_binds_context_with_deny_write_settings(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "orchestrator.workflow.shutil.which",
+        lambda executable: "/usr/local/bin/claude",
+    )
+    context_root = tmp_path / "infra"
+    context = ReadOnlyContext(
+        repository=RepositorySnapshot(str(context_root), "def", "infra-tree", ()),
+        policy=PolicyIdentity("infra-policy", ()),
+    )
+    plan = StructuredPlan.create(
+        task="Fix the app",
+        repository=RepositorySnapshot(str(tmp_path / "app"), "abc", "tree", ()),
+        policy=PolicyIdentity("policy", ()),
+        effective_constraints="Preserve unrelated work.",
+        allowed_paths=("src/**",),
+        prohibited_operations=("commit",),
+        required_checks=("pytest",),
+        proposal="Use infra as context.",
+        read_only_contexts=(context,),
+        denied_paths=("infra/**", "settings.py"),
+    )
+
+    command = build_execution_command(plan, Executor.CLAUDE)
+    settings = json.loads(command[command.index("--settings") + 1])
+
+    assert command[command.index("--add-dir") + 1] == str(context_root)
+    assert command[command.index("--setting-sources") + 1] == ""
+    assert settings["sandbox"]["enabled"] is True
+    assert settings["sandbox"]["failIfUnavailable"] is True
+    assert settings["sandbox"]["allowUnsandboxedCommands"] is False
+    deny_write = settings["sandbox"]["filesystem"]["denyWrite"]
+    assert f"/{context_root}" in deny_write
+    assert f"/{plan.repository.repo_root}/infra/**" in deny_write
+    assert f"/{plan.repository.repo_root}/settings.py" in deny_write
+    assert f"Edit(/{context_root}/**)" in settings["permissions"]["deny"]
+    assert (
+        f"Edit(/{plan.repository.repo_root}/infra/**)"
+        in settings["permissions"]["deny"]
+    )
+    assert (
+        f"Write(/{plan.repository.repo_root}/settings.py)"
+        in settings["permissions"]["deny"]
+    )
+    assert str(context_root) in command[-1]
+    assert "must never" in command[-1]
+    assert "Explicitly denied write paths" in command[-1]
+
+
+def test_context_result_rejects_any_repository_drift(tmp_path):
+    root = str(tmp_path / "infra")
+    before = {
+        root: RepositorySnapshot(root, "abc", "before", ()),
+    }
+    after = {
+        root: RepositorySnapshot(root, "abc", "after", ("main.tf",)),
+    }
+
+    with pytest.raises(ValueError, match="changed read-only context repository"):
+        validate_read_only_context_results(before, after)
 
 
 def test_execution_result_preserves_unrelated_preexisting_changes(tmp_path):
@@ -183,4 +255,28 @@ def test_execution_result_rejects_out_of_scope_change(tmp_path):
             after,
             before_metadata={},
             after_metadata={"SETUP.md": (1, 10, 4)},
+        )
+
+
+def test_execution_result_rejects_denied_change_even_when_broadly_allowed(tmp_path):
+    plan = StructuredPlan.create(
+        task="Refactor the application",
+        repository=RepositorySnapshot(str(tmp_path), "abc", "before", ()),
+        policy=PolicyIdentity("policy", ()),
+        effective_constraints="",
+        allowed_paths=("**",),
+        prohibited_operations=("commit",),
+        required_checks=("pytest",),
+        proposal="Refactor code without changing infrastructure.",
+        denied_paths=("infra/**",),
+    )
+    after = RepositorySnapshot(str(tmp_path), "abc", "after", ("infra/main.tf",))
+
+    with pytest.raises(ValueError, match=r"explicitly denied.*infra/main\.tf"):
+        validate_execution_result(
+            plan,
+            plan.repository,
+            after,
+            before_metadata={},
+            after_metadata={"infra/main.tf": (1, 10, 4)},
         )
