@@ -116,6 +116,16 @@ The execution prompt requires `ask_orchestrator` to receive the same task,
 repository root, and sanitized effective constraints used for planning. The
 prior plan proposal is treated as advisory evidence, not policy.
 
+The orchestrator consultation remains required by default. If tool discovery or
+the call still fails after a retry, the executor must stop before editing, report
+its attempts, and request explicit human approval in that execution session to
+continue without the tool. Unavailability alone is not authorization. After an
+unambiguous approval, the executor must prominently disclose the bypass and may
+proceed only within the already approved task, paths, and constraints. This
+runtime fallback does not bypass plan or approval validation, repository and
+policy drift checks, prompt egress scanning, allowed/denied path enforcement,
+approval consumption, or post-execution scope validation.
+
 Codex executes with only the target as a writable workspace. For Claude, the
 CLI translates target-repository deny patterns into invocation-local
 `Edit`/`Write` and sandbox `denyWrite` rules. It also supplies each bound context
@@ -154,6 +164,9 @@ does not transmit a prompt and therefore does not invoke the scanner.
   The orchestrator deliberately performs no automatic rollback.
 - If a required executor is unavailable, no write-capable process starts. Fix
   the local installation and revalidate with `--print-only`.
+- If `ask_orchestrator` remains unavailable after discovery is refreshed and the
+  call is retried, the executor pauses before editing and asks the human whether
+  to continue without it. A clear approval response is required to resume.
 
 ## Runtime records
 

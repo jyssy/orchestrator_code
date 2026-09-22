@@ -647,7 +647,9 @@ The intended end-to-end sequence is:
    approval.
 6. The approval is consumed before a separate write-capable executor starts.
 7. The executor calls `ask_orchestrator` with the same task, repository root,
-   and effective caller constraints.
+   and effective caller constraints. If discovery and a retry still cannot reach
+   the tool, it pauses before editing and asks the human for explicit approval
+   to continue without it. Any approved bypass is reported prominently.
 8. The executor evaluates the advice, edits only approved paths, runs permitted
    checks, and reports its handoff.
 9. The CLI rejects commits, validates final target Git-visible changed paths

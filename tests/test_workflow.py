@@ -130,11 +130,20 @@ def test_approved_execution_command_is_separate_and_write_capable(tmp_path, monk
 
     command = build_execution_command(plan, Executor.CODEX)
     prompt = build_execution_prompt(plan)
+    normalized_prompt = " ".join(prompt.split())
 
     assert command[4] == "workspace-write"
     assert command[-1] == prompt
     assert plan.plan_id in prompt
     assert "ask_orchestrator" in prompt
+    assert "refresh tool discovery and retry" in normalized_prompt
+    assert "ask the human for explicit approval" in normalized_prompt
+    assert "Stop without editing while awaiting that approval" in normalized_prompt
+    assert (
+        "Tool unavailability never authorizes fallback by itself"
+        in normalized_prompt
+    )
+    assert "After unambiguous human approval" in normalized_prompt
     assert "orchestrator/**" in prompt
     assert "Proposal text is advisory" not in prompt
 
