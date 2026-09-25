@@ -2,6 +2,7 @@
 pipeline.py — main orchestration: router → RAG → specialist → judge.
 """
 
+import time
 from pathlib import Path
 
 from orchestrator.approval import (
@@ -22,6 +23,12 @@ from orchestrator.egress_guard import ModelEgressBlocked, egress_scope, guard_te
 from orchestrator.judge import critique_and_revise_result
 from orchestrator.model_gateway import ProviderFailure
 from orchestrator.models import PolicyIdentity, ReadOnlyContext, StructuredPlan
+from orchestrator.observability import (
+    TraceObserver,
+    emit_trace,
+    trace_run,
+    trace_status,
+)
 from orchestrator.rag import retrieve_context_result
 from orchestrator.results import ComponentResult, ResultStatus, diagnostic
 from orchestrator.router import classify_result
@@ -238,9 +245,19 @@ def _build_context(
         guard_text(explicit_context, source="explicit repository context")
         sections.append(explicit_context)
 
+    retrieval_started = time.perf_counter()
     retrieval_result = retrieve_context_result(
         prompt,
         repo_root=str(resolved_root) if resolved_root else None,
+    )
+    emit_trace(
+        "retrieval.completed",
+        "retrieval",
+        trace_status(retrieval_result.status),
+        elapsed_from=retrieval_started,
+        attempts=retrieval_result.attempts,
+        code=retrieval_result.code,
+        fallback=retrieval_result.status is ResultStatus.DEGRADED_SUCCESS,
     )
     if component_results is not None:
         component_results.append(retrieval_result)
@@ -248,9 +265,19 @@ def _build_context(
         sections.append(retrieval_result.value)
 
     for context_root in read_only_context_roots:
+        retrieval_started = time.perf_counter()
         retrieval_result = retrieve_context_result(
             prompt,
             repo_root=str(context_root),
+        )
+        emit_trace(
+            "retrieval.completed",
+            "retrieval",
+            trace_status(retrieval_result.status),
+            elapsed_from=retrieval_started,
+            attempts=retrieval_result.attempts,
+            code=retrieval_result.code,
+            fallback=retrieval_result.status is ResultStatus.DEGRADED_SUCCESS,
         )
         if component_results is not None:
             component_results.append(retrieval_result)
@@ -395,6 +422,7 @@ def run(
     context_paths: list[str] | None = None,
     repo_root: str | None = None,
     effective_constraints: str | None = None,
+    observer: TraceObserver | None = None,
 ) -> dict:
     """
     Orchestrate a full request through the pipeline.
@@ -402,6 +430,49 @@ def run(
     Returns a dict with:
       task_type, context_used (bool), draft, final
     """
+    if observer is None:
+        return _run_result(
+            prompt,
+            context_path=context_path,
+            judge_enabled=judge_enabled,
+            context_paths=context_paths,
+            repo_root=repo_root,
+            effective_constraints=effective_constraints,
+        )
+
+    with trace_run(observer) as trace:
+        run_started = time.perf_counter()
+        trace.emit("run.started", "pipeline", "started")
+        result = _run_result(
+            prompt,
+            context_path=context_path,
+            judge_enabled=judge_enabled,
+            context_paths=context_paths,
+            repo_root=repo_root,
+            effective_constraints=effective_constraints,
+        )
+        trace.emit(
+            "run.completed",
+            "pipeline",
+            trace_status(result["status"]),
+            duration_ms=max(0, round((time.perf_counter() - run_started) * 1000)),
+            result_status=result["status"],
+            context_used=result["context_used"],
+            retrieval_used=result["retrieval_used"],
+        )
+        return result
+
+
+def _run_result(
+    prompt: str,
+    context_path: str | None,
+    judge_enabled: bool | None,
+    *,
+    context_paths: list[str] | None,
+    repo_root: str | None,
+    effective_constraints: str | None,
+) -> dict:
+    """Run the compatibility pipeline and return its existing result schema."""
     if not prompt.strip():
         return _failure_response(
             ResultStatus.INVALID_INPUT,
@@ -491,7 +562,18 @@ def _run_pipeline(
 
     with egress_scope(classification):
         guard_text(prompt, source="user task")
+        router_started = time.perf_counter()
         route_result = classify_result(prompt)
+        emit_trace(
+            "router.completed",
+            "router",
+            trace_status(route_result.status),
+            elapsed_from=router_started,
+            task_type=route_result.value,
+            attempts=route_result.attempts,
+            code=route_result.code,
+            fallback=route_result.status is ResultStatus.DEGRADED_SUCCESS,
+        )
         components.append(route_result)
         task_type = route_result.value
         if task_type is None:
@@ -511,6 +593,7 @@ def _run_pipeline(
             component_results=components,
         )
 
+        specialist_started = time.perf_counter()
         if task_type == "coding":
             specialist_result = code_result(prompt, context=context)
         elif task_type == "ops":
@@ -519,6 +602,16 @@ def _run_pipeline(
             specialist_result = summarize_result(prompt, context=context)
         else:
             specialist_result = reason_result(prompt, context=context)
+        emit_trace(
+            "specialist.completed",
+            "specialist",
+            trace_status(specialist_result.status),
+            elapsed_from=specialist_started,
+            task_type=task_type,
+            attempts=specialist_result.attempts,
+            code=specialist_result.code,
+            fallback=specialist_result.status is ResultStatus.DEGRADED_SUCCESS,
+        )
         components.append(specialist_result)
         draft = specialist_result.value
         if draft is None:

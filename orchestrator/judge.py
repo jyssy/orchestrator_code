@@ -4,10 +4,12 @@ Skipped when JUDGE_ENABLED=false or when the first answer is already confident.
 """
 
 import os
+import time
 
 from orchestrator.egress_guard import ModelEgressBlocked
 from orchestrator.model_gateway import ProviderFailure
 from orchestrator.model_roles import reasoning_model
+from orchestrator.observability import emit_trace
 from orchestrator.results import ComponentResult, ResultStatus, diagnostic
 from orchestrator.specialists import reason
 
@@ -142,6 +144,18 @@ def critique_and_revise_result(
         enabled = os.getenv("JUDGE_ENABLED", "true").lower() == "true"
 
     if not enabled:
+        emit_trace(
+            "judge_critique.completed",
+            "judge",
+            "skipped",
+            judge_enabled=False,
+        )
+        emit_trace(
+            "revision.skipped",
+            "revision",
+            "skipped",
+            revision_required=False,
+        )
         return ComponentResult(
             "judge",
             ResultStatus.SUCCESS,
@@ -157,16 +171,69 @@ def critique_and_revise_result(
         critique_context = (
             f"{critique_context}\n\nEffective policy and context:\n{context}"
         )
+    critique_started = time.perf_counter()
     try:
         critique = reason(critique_prompt, context=critique_context)
     except ModelEgressBlocked:
+        emit_trace(
+            "judge_critique.completed",
+            "judge",
+            "failed",
+            elapsed_from=critique_started,
+            judge_enabled=True,
+            code="model_egress_blocked",
+        )
         raise
     except ProviderFailure as exc:
+        emit_trace(
+            "judge_critique.completed",
+            "judge",
+            "degraded",
+            elapsed_from=critique_started,
+            judge_enabled=True,
+            attempts=exc.attempts,
+            code=exc.code,
+        )
+        emit_trace(
+            "revision.skipped",
+            "revision",
+            "skipped",
+            revision_required=False,
+        )
         return _fallback_result(draft, exc, revision=False)
     except Exception:  # noqa: BLE001 - retain draft with a content-safe warning
+        emit_trace(
+            "judge_critique.completed",
+            "judge",
+            "degraded",
+            elapsed_from=critique_started,
+            judge_enabled=True,
+            code="judge_internal_failure",
+        )
+        emit_trace(
+            "revision.skipped",
+            "revision",
+            "skipped",
+            revision_required=False,
+        )
         return _fallback_result(draft, None, revision=False)
 
-    if critique.strip().upper().startswith("LGTM"):
+    revision_required = not critique.strip().upper().startswith("LGTM")
+    emit_trace(
+        "judge_critique.completed",
+        "judge",
+        "success",
+        elapsed_from=critique_started,
+        judge_enabled=True,
+        revision_required=revision_required,
+    )
+    if not revision_required:
+        emit_trace(
+            "revision.skipped",
+            "revision",
+            "skipped",
+            revision_required=False,
+        )
         return ComponentResult(
             "judge", ResultStatus.SUCCESS, draft, model=reasoning_model()
         )
@@ -182,14 +249,47 @@ def critique_and_revise_result(
         revision_context = (
             f"{revision_context}\n\nEffective policy and context:\n{context}"
         )
+    revision_started = time.perf_counter()
     try:
         revised = reason(revision_prompt, context=revision_context)
     except ModelEgressBlocked:
+        emit_trace(
+            "revision.completed",
+            "revision",
+            "failed",
+            elapsed_from=revision_started,
+            revision_required=True,
+            code="model_egress_blocked",
+        )
         raise
     except ProviderFailure as exc:
+        emit_trace(
+            "revision.completed",
+            "revision",
+            "degraded",
+            elapsed_from=revision_started,
+            revision_required=True,
+            attempts=exc.attempts,
+            code=exc.code,
+        )
         return _fallback_result(draft, exc, revision=True)
     except Exception:  # noqa: BLE001 - retain draft with a content-safe warning
+        emit_trace(
+            "revision.completed",
+            "revision",
+            "degraded",
+            elapsed_from=revision_started,
+            revision_required=True,
+            code="revision_internal_failure",
+        )
         return _fallback_result(draft, None, revision=True)
+    emit_trace(
+        "revision.completed",
+        "revision",
+        "success",
+        elapsed_from=revision_started,
+        revision_required=True,
+    )
     return ComponentResult(
         "judge", ResultStatus.SUCCESS, revised, model=reasoning_model()
     )

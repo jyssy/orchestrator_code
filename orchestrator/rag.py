@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from dotenv import load_dotenv
 from orchestrator.egress_guard import ModelEgressBlocked, egress_scope, guard_text
 from orchestrator.model_gateway import ProviderFailure, embedding, rerank
 from orchestrator.model_roles import embedding_model, reranker_model
+from orchestrator.observability import emit_trace, trace_status
 from orchestrator.results import ComponentResult, ResultStatus, diagnostic
 from orchestrator.security import (
     INDEXABLE_EXTENSIONS,
@@ -88,16 +90,37 @@ class IndexReport:
 
 def _embed(texts: list[str]) -> list[list[float]]:
     """Embed safe texts with the configured REALMS embedding model."""
-    response = embedding(
-        model=f"openai/{embedding_model()}",
-        texts=texts,
-        api_base=_BASE_URL,
-        api_key=_API_KEY,
+    started = time.perf_counter()
+    try:
+        response = embedding(
+            model=f"openai/{embedding_model()}",
+            texts=texts,
+            api_base=_BASE_URL,
+            api_key=_API_KEY,
+        )
+        values = [item["embedding"] for item in response.data]
+    except Exception:
+        emit_trace(
+            "embedding.completed",
+            "embedding",
+            "failed",
+            elapsed_from=started,
+            batch_size=len(texts),
+        )
+        raise
+    emit_trace(
+        "embedding.completed",
+        "embedding",
+        "success",
+        elapsed_from=started,
+        batch_size=len(texts),
     )
-    return [item["embedding"] for item in response.data]
+    return values
 
 
-def _rerank_result(query: str, documents: list[str]) -> ComponentResult[list[int]]:
+def _rerank_result_unobserved(
+    query: str, documents: list[str]
+) -> ComponentResult[list[int]]:
     """Return ranked indices and make any stable-order fallback visible."""
     model = reranker_model()
     try:
@@ -185,6 +208,34 @@ def _rerank_result(query: str, documents: list[str]) -> ComponentResult[list[int
             ),
             model=model,
         )
+
+
+def _rerank_result(query: str, documents: list[str]) -> ComponentResult[list[int]]:
+    """Rerank candidates and emit only counts and sanitized component metadata."""
+    started = time.perf_counter()
+    try:
+        result = _rerank_result_unobserved(query, documents)
+    except Exception:
+        emit_trace(
+            "reranking.completed",
+            "reranker",
+            "failed",
+            elapsed_from=started,
+            candidate_count=len(documents),
+        )
+        raise
+    emit_trace(
+        "reranking.completed",
+        "reranker",
+        trace_status(result.status),
+        elapsed_from=started,
+        attempts=result.attempts,
+        code=result.code,
+        candidate_count=len(documents),
+        selected_count=len(result.value or []),
+        fallback=result.status is ResultStatus.DEGRADED_SUCCESS,
+    )
+    return result
 
 
 def _rerank(query: str, documents: list[str]) -> list[int]:

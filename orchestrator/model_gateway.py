@@ -13,6 +13,7 @@ import httpx
 import litellm
 
 from orchestrator.egress_guard import guard_payload
+from orchestrator.observability import emit_trace
 from orchestrator.results import ResultStatus
 
 _TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
@@ -91,16 +92,56 @@ def _classify_provider_exception(exc: Exception) -> ProviderFailure:
     )
 
 
-def _invoke_provider(operation: Callable[[], Any], *, remote: bool) -> Any:
+def _invoke_provider(
+    operation: Callable[[], Any], *, remote: bool, operation_name: str
+) -> Any:
     """Invoke a provider with bounded retries only for classified transient errors."""
     max_attempts, base_delay = _retry_settings() if remote else (1, 0.0)
     for attempt in range(1, max_attempts + 1):
+        attempt_started = time.perf_counter()
         try:
-            return operation()
-        except ProviderFailure:
+            result = operation()
+            emit_trace(
+                "provider.attempt",
+                "provider",
+                "success",
+                elapsed_from=attempt_started,
+                operation=operation_name,
+                provider="remote" if remote else "local",
+                remote=remote,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
+            return result
+        except ProviderFailure as failure:
+            emit_trace(
+                "provider.attempt",
+                "provider",
+                "failed",
+                elapsed_from=attempt_started,
+                operation=operation_name,
+                provider="remote" if remote else "local",
+                remote=remote,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                code=failure.code,
+            )
             raise
         except Exception as exc:  # noqa: BLE001 - provider libraries vary
             failure = _classify_provider_exception(exc)
+            will_retry = failure.retryable and attempt < max_attempts
+            emit_trace(
+                "provider.attempt",
+                "provider",
+                "degraded" if will_retry else "failed",
+                elapsed_from=attempt_started,
+                operation=operation_name,
+                provider="remote" if remote else "local",
+                remote=remote,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                code=failure.code,
+            )
             if not failure.retryable or attempt == max_attempts:
                 raise ProviderFailure(
                     failure.status,
@@ -109,6 +150,17 @@ def _invoke_provider(operation: Callable[[], Any], *, remote: bool) -> Any:
                     attempts=attempt,
                     retryable=failure.retryable,
                 ) from None
+            emit_trace(
+                "provider.retry",
+                "provider",
+                "retrying",
+                operation=operation_name,
+                provider="remote" if remote else "local",
+                remote=remote,
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+                code=failure.code,
+            )
             time.sleep(base_delay * (2 ** (attempt - 1)))
     raise AssertionError("unreachable provider retry state")
 
@@ -120,6 +172,7 @@ def _post_json(
     timeout: float,
     headers: dict[str, str] | None = None,
     remote: bool,
+    operation_name: str,
 ) -> Any:
     def operation() -> Any:
         response = httpx.post(
@@ -131,7 +184,9 @@ def _post_json(
         response.raise_for_status()
         return response
 
-    return _invoke_provider(operation, remote=remote)
+    return _invoke_provider(
+        operation, remote=remote, operation_name=operation_name
+    )
 
 
 def _serialize_model_payload(payload: Any) -> str:
@@ -166,7 +221,11 @@ def completion(
         source="assembled completion payload",
         remote=remote,
     )
-    return _invoke_provider(lambda: litellm.completion(**request), remote=remote)
+    return _invoke_provider(
+        lambda: litellm.completion(**request),
+        remote=remote,
+        operation_name="completion",
+    )
 
 
 def embedding(
@@ -190,6 +249,7 @@ def embedding(
             api_key=api_key,
         ),
         remote=True,
+        operation_name="embedding",
     )
 
 
@@ -220,6 +280,7 @@ def ollama_generate(
         payload=payload,
         timeout=timeout,
         remote=False,
+        operation_name="routing",
     )
 
 
@@ -251,4 +312,5 @@ def rerank(
         payload=payload,
         timeout=timeout,
         remote=True,
+        operation_name="reranking",
     )

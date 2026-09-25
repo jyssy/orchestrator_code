@@ -6,6 +6,8 @@ Start with: uv run python mcp_server.py
 Register with any MCP-capable client (see SETUP.md Phase 3).
 """
 
+import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -13,12 +15,13 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 
 from orchestrator.approval import validate_approval
 from orchestrator.context import capture_repository_snapshot, reload_policy_identity
 from orchestrator.model_roles import model_role_label, reasoning_model
 from orchestrator.models import ApprovalRecord, StructuredPlan
+from orchestrator.observability import CallbackTraceObserver, TraceEventV1
 from orchestrator.pipeline import plan, plan_structured, run
 from orchestrator.rag import index_directory, scan_directory
 
@@ -99,6 +102,69 @@ def ask_orchestrator_structured(
         judge_enabled=use_judge,
         effective_constraints=effective_constraints,
     )
+
+
+@mcp.tool(
+    timeout=300,
+    annotations={"readOnlyHint": True, "openWorldHint": True},
+)
+async def ask_orchestrator_observed(
+    prompt: str,
+    ctx: Context,
+    context_path: str = "",
+    context_paths: list[str] | None = None,
+    repo_root: str = "",
+    use_judge: bool = True,
+    effective_constraints: str = "",
+) -> dict:
+    """Return the structured answer while publishing TraceEventV1 progress."""
+    loop = asyncio.get_running_loop()
+    progress_tasks: set[asyncio.Task[None]] = set()
+
+    def schedule_progress(event: TraceEventV1) -> None:
+        if len(progress_tasks) >= 128:
+            return
+        message = json.dumps(
+            event.to_dict(), sort_keys=True, separators=(",", ":")
+        )
+        task = asyncio.create_task(
+            ctx.report_progress(float(event.sequence), message=message)
+        )
+        progress_tasks.add(task)
+
+        def consume_result(completed: asyncio.Task[None]) -> None:
+            progress_tasks.discard(completed)
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:  # noqa: BLE001 - progress failures stay isolated
+                return
+
+        task.add_done_callback(consume_result)
+
+    def publish(event: TraceEventV1) -> None:
+        try:
+            loop.call_soon_threadsafe(schedule_progress, event)
+        except RuntimeError:
+            return
+
+    result = await asyncio.to_thread(
+        run,
+        prompt,
+        context_path=context_path or None,
+        context_paths=context_paths,
+        repo_root=repo_root or None,
+        judge_enabled=use_judge,
+        effective_constraints=effective_constraints,
+        observer=CallbackTraceObserver(publish),
+    )
+    await asyncio.sleep(0)
+    if progress_tasks:
+        _, pending = await asyncio.wait(progress_tasks, timeout=0.05)
+        for task in pending:
+            task.cancel()
+    return result
 
 
 @mcp.tool(

@@ -30,6 +30,9 @@ As of August 2026, three hardening increments are implemented:
 - **Phase 2B — fail-visible reliability:** typed component outcomes, sanitized
   diagnostics, bounded transient-only remote retries, visible fallback states,
   and additive structured CLI/MCP reporting.
+- **Opt-in observability:** a versioned, metadata-only event contract and an
+  additive MCP tool that can publish progress without changing orchestration
+  results or existing interfaces.
 
 Phase 2B does not change the human approval steps or give the orchestrator write
 authority. Transactional RAG, a general model registry, deployment telemetry,
@@ -71,6 +74,9 @@ mcp_server.py / FastMCP
   |
   +-- ask_orchestrator_structured
   |                        -> same pipeline + model metadata/status envelope
+  |
+  +-- ask_orchestrator_observed
+  |                        -> same structured result + MCP progress events
   |
   +-- audit_index ---------> safety scan only
   |
@@ -142,7 +148,7 @@ equivalent client-side registrations described in [`SETUP.md`](SETUP.md).
 
 ### Exposed tools
 
-The server exposes seven tools, including the five operational tools below and
+The server exposes eight tools, including the six operational tools below and
 the structured-plan validation tools described under approval enforcement.
 
 #### `plan_task`
@@ -177,6 +183,58 @@ per-component model/status, warnings, retry-attempt counts, and a safe error cod
 when applicable.
 The diagnostic envelope contains no prompts, source chunks, credentials,
 provider bodies, scanner output, or unrestricted exception text.
+
+#### `ask_orchestrator_observed`
+
+Inputs and the final return schema match `ask_orchestrator_structured`. This
+separate, opt-in tool additionally sends JSON-encoded `TraceEventV1` objects as
+MCP progress-notification messages. Existing MCP tools and the CLI do not enable
+an observer and retain their existing behavior and return schemas.
+
+An MCP client opts in by calling this tool with a progress callback. For the
+Django MCP adapter, this is the `progress_callback` argument to
+`Client.call_tool`; the callback may validate the event and copy permitted
+metadata into its own bounded activity store. The orchestrator does not assume
+or create a Django HTTP endpoint.
+
+Progress delivery is best effort. Publishing is scheduled off the synchronous
+pipeline path, pending progress work is bounded, and final flushing has a short
+time bound. A disconnected or slow client can therefore miss events, but cannot
+change, fail, retry, or materially delay the orchestration result. Clients use
+`run_id` and `sequence` to reject duplicates or out-of-order events. There is no
+server-side replay or persistence in version 1.
+
+### Trace event contract (version 1)
+
+`TraceEventV1` is defined in `orchestrator/observability.py` and contains:
+
+| Field | Meaning |
+| --- | --- |
+| `contract_version` | Integer schema version; currently `1`. |
+| `run_id` | Random UUID scoped to one observed pipeline call. |
+| `sequence` | One-based, monotonically increasing order within the run. |
+| `timestamp` | UTC ISO 8601 emission timestamp. |
+| `event_type` | Versioned lifecycle name such as `router.completed`. |
+| `component` | Stable component name such as `retrieval` or `provider`. |
+| `status` | `started`, `success`, `degraded`, `failed`, `skipped`, or `retrying`. |
+| `duration_ms` | Optional non-negative monotonic elapsed duration. |
+| `metadata` | Allowlisted primitive operational fields only. |
+
+Events cover run start and completion, routing, retrieval, embedding,
+reranking, specialist work, judge critique, optional revision, provider
+attempts, and retries. Metadata can include identifiers and counts such as a
+selected task type, attempt number, batch or candidate count, fallback state,
+and sanitized stable status code. Model attribution remains in the structured
+result rather than progress metadata because model identifiers are configurable.
+
+The metadata builder uses an allowlist rather than a blacklist. It drops unknown
+keys and non-primitive values, bounds and validates string values, and never
+accepts prompts, completions, source chunks, credentials, provider bodies,
+scanner output, local paths, policy content, or exception objects/text. Observer
+exceptions are discarded without including their text in logs or result
+payloads. Calling
+`pipeline.run()` without an observer follows the pre-existing unobserved path;
+the default observer is therefore a no-op.
 
 #### `audit_index`
 
