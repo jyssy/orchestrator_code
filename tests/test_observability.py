@@ -75,6 +75,14 @@ def test_observed_run_preserves_result_schema_and_orders_metadata(monkeypatch):
     }
     assert all(event.contract_version == 1 for event in events)
     assert all(datetime.fromisoformat(event.timestamp) for event in events)
+    assert actual["model_roles"] == {
+        "reviewer": "reviewer-model",
+        "judge": "judge-model",
+        "router": "router-model",
+    }
+    assert "router-model" not in json.dumps(
+        [event.to_dict() for event in events]
+    )
     assert set(actual) == {
         "status",
         "task_type",

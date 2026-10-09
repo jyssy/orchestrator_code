@@ -546,6 +546,23 @@ def _failure_response(
     }
 
 
+def _model_roles(
+    components: list[ComponentResult[object]],
+    *,
+    reviewer: str | None,
+    judge: str | None,
+) -> dict[str, str | None]:
+    """Return model attribution, including the router only when it reported one."""
+    roles = {"reviewer": reviewer, "judge": judge}
+    router = next(
+        (component for component in components if component.component == "router"),
+        None,
+    )
+    if router is not None and router.model is not None:
+        roles["router"] = router.model
+    return roles
+
+
 def _run_pipeline(
     prompt: str,
     context_path: str | None,
@@ -649,10 +666,11 @@ def _run_pipeline(
         "retrieval_used": bool(retrieval and retrieval.value),
         "repo_root": str(resolved_root) if resolved_root else None,
         "policy_fingerprint": policy.fingerprint,
-        "model_roles": {
-            "reviewer": specialist_result.model,
-            "judge": judge_result.model,
-        },
+        "model_roles": _model_roles(
+            components,
+            reviewer=specialist_result.model,
+            judge=judge_result.model,
+        ),
         "draft": draft,
         "final": final,
         "warnings": warnings,
@@ -676,10 +694,11 @@ def _component_failure_response(
         "retrieval_used": False,
         "repo_root": str(resolved_root) if resolved_root else None,
         "policy_fingerprint": policy.fingerprint,
-        "model_roles": {
-            "reviewer": failure.model,
-            "judge": None,
-        },
+        "model_roles": _model_roles(
+            components,
+            reviewer=failure.model,
+            judge=None,
+        ),
         "draft": "",
         "final": "",
         "warnings": _public_warnings(components),

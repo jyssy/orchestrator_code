@@ -371,6 +371,58 @@ def test_pipeline_returns_answer_with_visible_retrieval_degradation(monkeypatch)
     assert result["warnings"][0]["code"] == "rag_index_missing"
 
 
+def test_pipeline_reports_executed_router_model(monkeypatch):
+    _patch_pipeline_success(
+        monkeypatch,
+        ComponentResult("retrieval", ResultStatus.SUCCESS, ""),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "classify_result",
+        lambda prompt: ComponentResult(
+            "router",
+            ResultStatus.SUCCESS,
+            "coding",
+            model="executed-router-model",
+        ),
+    )
+
+    result = pipeline.run("ordinary request", judge_enabled=False)
+
+    assert result["model_roles"] == {
+        "reviewer": "Qwen3-Coder-Next",
+        "judge": "gpt-oss-120b",
+        "router": "executed-router-model",
+    }
+
+
+def test_pipeline_omits_router_role_for_heuristic_fallback(monkeypatch):
+    _patch_pipeline_success(
+        monkeypatch,
+        ComponentResult("retrieval", ResultStatus.SUCCESS, ""),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "classify_result",
+        lambda prompt: ComponentResult(
+            "router",
+            ResultStatus.DEGRADED_SUCCESS,
+            "coding",
+            code="router_heuristic_fallback",
+            message="Local routing was unavailable; heuristics were used.",
+        ),
+    )
+
+    result = pipeline.run("ordinary request", judge_enabled=False)
+
+    assert result["status"] == "degraded_success"
+    assert "router" not in result["model_roles"]
+    assert result["model_roles"] == {
+        "reviewer": "Qwen3-Coder-Next",
+        "judge": "gpt-oss-120b",
+    }
+
+
 def test_pipeline_failure_and_internal_errors_are_content_safe(monkeypatch):
     _patch_pipeline_success(
         monkeypatch,

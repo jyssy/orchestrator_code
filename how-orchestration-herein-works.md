@@ -442,7 +442,11 @@ The complete internal result contains:
     "context_used": True | False,
     "retrieval_used": True | False,
     "repo_root": "/resolved/repository/or/None",
-    "model_roles": {"reviewer": "...", "judge": "..."},
+    "model_roles": {
+        "reviewer": "...",
+        "judge": "...",
+        "router": "...",  # optional
+    },
     "draft": "initial specialist answer",
     "final": "original or judge-revised answer",
     "warnings": [{"component": "...", "code": "...", "message": "..."}],
@@ -458,6 +462,14 @@ MCP tool exposes the complete sanitized result, and the direct CLI prints
 overall status, safe warnings, task type, actual retrieval use, and model-labelled
 draft/revision differences. Answer fields remain the model's verbatim output;
 only diagnostics are restricted to safe codes and fixed messages.
+
+`model_roles.router` identifies the router model that actually completed model
+routing for the current call. The pipeline derives it from the router component
+result and omits the key when that component does not report a model, including
+keyword-heuristic fallback. This is a live-result field only: existing stored or
+previously observed results are not rewritten or backfilled. Observed calls return
+the same field in their final structured result; router identities are not added
+to progress-event metadata.
 
 ## Classification and Specialist Routing
 
